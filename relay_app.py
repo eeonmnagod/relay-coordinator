@@ -2,6 +2,58 @@ import streamlit as st
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
+import os
+
+# --- APP SETUP & STATE MANAGEMENT ---
+st.set_page_config(page_title="IDMT Time Grading App", layout="wide")
+
+# 1. LANDING PAGE & ACCEPTANCE GATE
+if 'accepted_terms' not in st.session_state:
+    st.session_state.accepted_terms = False
+
+if not st.session_state.accepted_terms:
+    # Inject dark mode for landing page
+    st.markdown("""
+    <style>
+        .stApp { background-color: #0E1117; color: #FAFAFA; }
+        .st-emotion-cache-16txtl3 { padding: 2rem 1.5rem; background-color: #262730; }
+    </style>
+    """, unsafe_allow_html=True)
+    
+    st.title("⚡ Protection Relay Coordination Tool")
+    st.markdown("### Welcome, Pallav.")
+    st.markdown("""
+    This application is designed to calculate Inverse Definite Minimum Time (IDMT) relay settings, verify 100ms coordination margins, and generate Time-Current Characteristic (TCC) curves for field deployment.
+    
+    **Instructions for Use:**
+    1. **Add Relays:** Use the sidebar menu to input Substation and Feeder parameters.
+    2. **Calculate:** Enter the Expected Fault Current and Pick-up Current.
+    3. **Auto-Grade:** Use the "Auto-Calculate" mode to automatically generate a TMS that maintains a 100ms margin above a downstream relay.
+    4. **Database:** Click "Add Relay to Database" to save your configuration. Your data will persist even if you close the browser.
+    5. **Manage Data:** In the main table, you can double-click cells to edit them, or select a row's checkbox (on the far left) and press your **Delete** key to remove it. Click the "Update Database" button below the table to commit your changes.
+    """)
+    
+    st.warning("⚠️ **Safety Notice:** This tool provides mathematical TCC grading. All settings must be verified against actual field hardware specifications before physical deployment.")
+    
+    if st.button("I Accept and Understand the Instructions"):
+        st.session_state.accepted_terms = True
+        st.rerun()
+    
+    st.stop() # Halts the script here until the user accepts
+
+# --- DATABASE LOGIC ---
+DATA_FILE = "relay_database.csv"
+
+def load_db():
+    if os.path.exists(DATA_FILE):
+        return pd.read_csv(DATA_FILE)
+    return pd.DataFrame(columns=[
+        "Substation", "Feeder", "Voltage", "CT (A)", 
+        "Fault (A)", "Pick-up (A)", "Curve", "TMS", "Op Time (s)"
+    ])
+
+def save_db(dataframe):
+    dataframe.to_csv(DATA_FILE, index=False)
 
 # --- CORE LOGIC ---
 CURVE_CONSTANTS = {
@@ -24,12 +76,6 @@ def calc_required_tms(target_time, psm, curve_constant):
         return 0.0
     return target_time / (curve_constant / ((psm ** 0.02) - 1))
 
-# --- APP SETUP & STATE MANAGEMENT ---
-st.set_page_config(page_title="IDMT Time Grading App", layout="wide")
-
-if 'grading_table' not in st.session_state:
-    st.session_state.grading_table = []
-
 # --- DARK MODE UI INJECTION ---
 st.sidebar.header("🎨 UI Settings")
 dark_mode = st.sidebar.toggle("🌙 Enable Dark Mode", value=True)
@@ -49,7 +95,10 @@ else:
 
 st.title("⚡ Substation Relay Time Grading")
 
-# --- SIDEBAR INPUTS (Blank by Default) ---
+# Load existing data for reference
+db_df = load_db()
+
+# --- SIDEBAR INPUTS ---
 st.sidebar.header("1. Feeder Identification")
 substation = st.sidebar.text_input("Substation Name", value=None, placeholder="e.g. Nainpur")
 feeder = st.sidebar.text_input("Feeder Name", value=None, placeholder="e.g. 11kV Main")
@@ -68,12 +117,15 @@ tms = None
 if tms_mode == "Manual Entry":
     tms = st.sidebar.number_input("Time Multiplier Setting (TMS)", min_value=0.01, value=None, step=0.01, placeholder="e.g. 0.10")
 else:
-    if st.session_state.grading_table:
-        downstream_options = [f"{r['Substation']} - {r['Feeder']}" for r in st.session_state.grading_table]
+    if not db_df.empty:
+        downstream_options = [f"{row['Substation']} - {row['Feeder']}" for _, row in db_df.iterrows()]
         selected_ds_name = st.sidebar.selectbox("Select Downstream Relay", downstream_options)
         
         if fault_current and pickup_current:
-            ds_relay = next(r for r in st.session_state.grading_table if f"{r['Substation']} - {r['Feeder']}" == selected_ds_name)
+            # Locate the selected downstream relay in the dataframe
+            ds_sub, ds_feed = selected_ds_name.split(" - ", 1)
+            ds_relay = db_df[(db_df['Substation'] == ds_sub) & (db_df['Feeder'] == ds_feed)].iloc[0]
+            
             ds_c_const = CURVE_CONSTANTS["Standard Inverse (1.3 Sec)"] if ds_relay["Curve"] == "1.3s" else CURVE_CONSTANTS["Very Inverse (3.0 Sec)"]
             
             ds_psm = calc_psm(fault_current, ds_relay["Pick-up (A)"])
@@ -91,9 +143,9 @@ else:
             else:
                 st.sidebar.error("Downstream relay does not operate at this fault current.")
     else:
-        st.sidebar.warning("Save at least one feeder to the table first to use Auto-Calculate.")
+        st.sidebar.warning("Save at least one feeder to the database first to use Auto-Calculate.")
 
-# --- CURRENT CALCULATION (With Safety Checks) ---
+# --- CURRENT CALCULATION ---
 current_psm = np.nan
 current_op_time = np.nan
 
@@ -102,7 +154,6 @@ if fault_current and pickup_current:
     if tms:
         current_op_time = calc_time(current_psm, tms, CURVE_CONSTANTS[curve_type])
 
-# Use fallback display names if fields are empty
 disp_feeder = feeder if feeder else "Pending Feeder"
 disp_sub = substation if substation else "Pending Substation"
 
@@ -112,12 +163,12 @@ col1.metric("Calculated PSM", f"{current_psm:.2f}" if not np.isnan(current_psm) 
 col2.metric("Operating Time", f"{current_op_time:.3f} Sec" if not np.isnan(current_op_time) else "--")
 col3.metric("Calculated TMS", f"{tms:.4f}" if tms else "--")
 
-# Save Button (Disabled if missing data)
-if st.button("💾 Save to Grading Table"):
+# Save to Database Button
+if st.sidebar.button("💾 Add Relay to Database", type="primary"):
     if None in [substation, feeder, ct_rating, fault_current, pickup_current, tms] or substation == "" or feeder == "":
-        st.error("⚠️ Please fill out all Feeder and Relay Parameters before saving.")
+        st.sidebar.error("⚠️ Please fill out all parameters.")
     else:
-        st.session_state.grading_table.append({
+        new_row = pd.DataFrame([{
             "Substation": substation,
             "Feeder": feeder,
             "Voltage": voltage_level,
@@ -127,38 +178,45 @@ if st.button("💾 Save to Grading Table"):
             "Curve": "1.3s" if "1.3" in curve_type else "3.0s",
             "TMS": round(tms, 4),
             "Op Time (s)": round(current_op_time, 3) if not np.isnan(current_op_time) else "No Trip"
-        })
-        st.success(f"Saved {feeder} to the coordination table.")
+        }])
+        updated_db = pd.concat([db_df, new_row], ignore_index=True)
+        save_db(updated_db)
+        st.sidebar.success("Added to database!")
+        st.rerun()
 
 st.divider()
 
-# --- GRADING TABLE ---
-st.subheader("Coordination & Time Grading Table")
-if st.session_state.grading_table:
-    df = pd.DataFrame(st.session_state.grading_table)
-    st.dataframe(df, use_container_width=True)
+# --- INTERACTIVE DATABASE TABLE ---
+st.subheader("Coordination & Time Grading Database")
+if not db_df.empty:
+    st.markdown("✏️ *You can edit cells directly. To **delete a row**, select the checkbox on its left edge and press the `Delete` key on your keyboard.*")
     
-    if st.button("🗑️ Clear All Saved Data"):
-        st.session_state.grading_table = []
+    # st.data_editor allows dynamic row addition/deletion
+    edited_df = st.data_editor(db_df, num_rows="dynamic", use_container_width=True, key="data_editor")
+    
+    # Button to commit table edits or deletions back to the CSV
+    if st.button("🔄 Commit Table Changes to Database"):
+        save_db(edited_df)
+        st.success("Database updated successfully!")
         st.rerun()
 else:
-    st.info("No relays saved yet. Fill out the parameters on the left and click 'Save to Grading Table'.")
+    st.info("Database is empty. Configure a relay on the left and click 'Add Relay to Database'.")
 
 # --- MULTI-CURVE PLOTTING ---
 st.subheader("TCC Coordination Plot")
-if st.session_state.grading_table:
+if not db_df.empty:
     fig = go.Figure()
     plot_currents = np.linspace(100, 15000, 500)
     
-    for entry in st.session_state.grading_table:
-        c_const = CURVE_CONSTANTS["Standard Inverse (1.3 Sec)"] if entry["Curve"] == "1.3s" else CURVE_CONSTANTS["Very Inverse (3.0 Sec)"]
-        times = [calc_time(calc_psm(fc, entry["Pick-up (A)"]), entry["TMS"], c_const) for fc in plot_currents]
+    for _, row in db_df.iterrows():
+        c_const = CURVE_CONSTANTS["Standard Inverse (1.3 Sec)"] if row["Curve"] == "1.3s" else CURVE_CONSTANTS["Very Inverse (3.0 Sec)"]
+        times = [calc_time(calc_psm(fc, row["Pick-up (A)"]), row["TMS"], c_const) for fc in plot_currents]
         
         fig.add_trace(go.Scatter(
             x=plot_currents, 
             y=times, 
             mode='lines', 
-            name=f'{entry["Substation"]} - {entry["Feeder"]}'
+            name=f'{row["Substation"]} - {row["Feeder"]}'
         ))
 
     fig.update_layout(
