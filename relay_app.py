@@ -21,7 +21,7 @@ if not st.session_state.accepted_terms:
     """, unsafe_allow_html=True)
     
     st.title("⚡ Protection Relay Coordination Tool")
-    st.markdown("### Welcome, Pallav.")
+    st.markdown("### Welcome,")
     st.markdown("""
     This application is designed to calculate Inverse Definite Minimum Time (IDMT) relay settings, verify 100ms coordination margins, and generate Time-Current Characteristic (TCC) curves for field deployment.
     
