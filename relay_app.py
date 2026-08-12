@@ -15,7 +15,10 @@ if not st.session_state.accepted_terms:
     st.title("⚡ Protection Relay Coordination Tool")
     st.markdown("### Welcome, Pallav.")
     st.markdown("""
-    **New Feature:** Directional Auto-Coordination. The app now asks whether you are grading towards an upstream or downstream relay, automatically fetches the correct grading fault current from the database, and applies the +/- 100ms margin.
+    **Instructions:**
+    1. Fill out your downstream relay first using **Manual Entry**.
+    2. Click **Add Relay to Database**.
+    3. Start your upstream relay. Switch TMS Mode to **Auto-Coordinate**. The Direction and Auto-Fault features will unlock.
     """)
     if st.button("I Accept and Understand"):
         st.session_state.accepted_terms = True
@@ -91,9 +94,17 @@ st.sidebar.header("2. IDMT (51) Parameters")
 curve_type = st.sidebar.selectbox("Curve Type", list(CURVE_CONSTANTS.keys()))
 pickup_current = st.sidebar.number_input("IDMT Pick-up Current (A)", min_value=1.0, value=None, step=10.0)
 
-# --- 3. TMS & GRADING LOGIC ---
+# --- 3. TMS & GRADING LOGIC (FIXED UI) ---
 st.sidebar.header("3. Time Grading & TMS")
 tms_mode = st.sidebar.radio("TMS Mode", ["Manual Entry", "Auto-Coordinate (100ms Margin)"])
+
+# Always show the Direction toggle, but disable it if in Manual mode
+coord_dir = st.sidebar.radio(
+    "Coordination Direction", 
+    ["Towards Downstream (This relay is Upstream)", "Towards Upstream (This relay is Downstream)"],
+    disabled=(tms_mode == "Manual Entry")
+)
+
 tms = None
 target_margin_time = 0.100 
 fault_current = None
@@ -103,11 +114,6 @@ if tms_mode == "Manual Entry":
     tms = st.sidebar.number_input("TMS", min_value=0.01, value=None, step=0.01)
 else:
     if not db_df.empty:
-        coord_dir = st.sidebar.radio("Coordination Direction", [
-            "Towards Downstream (This relay is Upstream)", 
-            "Towards Upstream (This relay is Downstream)"
-        ])
-        
         ds_options = [f"{row['Substation']} - {row['Feeder']}" for _, row in db_df.iterrows()]
         selected_ref = st.sidebar.selectbox("Select Reference Relay", ds_options)
         
@@ -127,6 +133,7 @@ else:
             ref_psm = calc_psm(auto_fault, ref_relay["Pick-up (A)"])
             ref_time = calc_time(ref_psm, ref_relay["TMS"], ref_c_const)
             
+        # This is the Auto-Populated field. It is locked (disabled) so the math stays rigorous.
         fault_current = st.sidebar.number_input("Grading Fault Current (A)", value=auto_fault, disabled=True)
             
         if pickup_current:
@@ -149,7 +156,9 @@ else:
             else:
                 st.sidebar.error("Reference relay does not operate.")
     else:
-        st.sidebar.warning("Save a relay to the database first.")
+        # If DB is empty, keep structure but disable inputs
+        st.sidebar.warning("⚠️ Save at least one relay to the database first to unlock Auto-Coordination.")
+        fault_current = st.sidebar.number_input("Grading Fault Current (A)", value=None, disabled=True)
 
 # --- 4. HIGH-SET (INSTANTANEOUS) ELEMENT ---
 st.sidebar.header("4. High-Set (50) Element")
