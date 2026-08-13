@@ -9,9 +9,8 @@ st.set_page_config(page_title="DISCOM Relay Coordination", layout="wide")
 
 st.title("⚡ Protection Relay Time Grading (DISCOM Standard)")
 st.markdown("""
-This version utilizes standard DISCOM logic. 
-The static fault current inputs and auto-calculations have been removed. Instead, **the math does the work in the curve plotting**. 
-Simply enter your relay parameters, and use the interactive TCC graph to trace operating times across all fault currents to visually verify your 100ms coordination margins.
+This version utilizes standard DISCOM logic. Enter your relay parameters, and use the interactive TCC graph to trace operating times. 
+**New Feature:** Use the Margin Analytics tool below the table to automatically calculate the maximum allowable fault current before your 100ms coordination breaks.
 """)
 
 # --- DATABASE LOGIC ---
@@ -29,22 +28,18 @@ def save_db(dataframe):
 
 db_df = load_db()
 
-# --- CORE MATH LOGIC (From Spreadsheet) ---
+# --- CORE MATH LOGIC ---
 CURVE_CONSTANTS = {
     "1.3 Sec curve": 0.0607,
     "3.0 Sec curve": 0.14
 }
 
 def calc_time(fault_current, pickup_current, tms, curve_constant):
-    """Calculates Operating Time: (a / ((PSM^0.02) - 1)) * TMS"""
     if pickup_current == 0:
         return np.nan
-    
     psm = fault_current / pickup_current
-    
     if psm <= 1.0 or not tms:
         return np.nan
-        
     return (curve_constant / ((psm ** 0.02) - 1)) * tms
 
 def parse_voltage(v_str):
@@ -52,6 +47,55 @@ def parse_voltage(v_str):
         return float(v_str.lower().replace("kv", "").strip())
     except:
         return 1.0
+
+# --- NUMERICAL HIGH-SET CALCULATOR (Bisection Method) ---
+def calculate_high_set_limit(up_row, down_row, margin=0.100, max_fc=50000):
+    down_v = parse_voltage(down_row["Voltage"])
+    up_v = parse_voltage(up_row["Voltage"])
+    trans_ratio = down_v / up_v # Ratio to reflect downstream fault to upstream relay
+    
+    c_down = CURVE_CONSTANTS.get(down_row["Curve"], 0.0607)
+    c_up = CURVE_CONSTANTS.get(up_row["Curve"], 0.0607)
+
+    def get_margin(I_down):
+        I_up = I_down * trans_ratio
+        t_d = calc_time(I_down, down_row["Pick-up (A)"], down_row["TMS"], c_down)
+        t_u = calc_time(I_up, up_row["Pick-up (A)"], up_row["TMS"], c_up)
+        if np.isnan(t_d) or np.isnan(t_u):
+            return np.nan
+        return t_u - t_d
+
+    # Find where both relays are operating
+    min_i_down = down_row["Pick-up (A)"] * 1.05
+    min_i_up_referred = (up_row["Pick-up (A)"] / trans_ratio) * 1.05
+    low = max(min_i_down, min_i_up_referred)
+    high = max_fc
+
+    m_low = get_margin(low)
+    m_high = get_margin(high)
+
+    if np.isnan(m_low):
+        return None, "Relays do not operate at low fault currents. Check Pick-up values."
+    if m_low < margin:
+        return None, f"Grading Failed: Margin is already {m_low*100:.0f}ms (below 100ms) near pick-up."
+    if m_high > margin:
+        return None, f"Margin remains > 100ms up to {max_fc} A. No High-Set required."
+
+    # Binary search for the exact 100ms crossing point
+    for _ in range(100):
+        mid = (low + high) / 2
+        m_mid = get_margin(mid)
+        if np.isnan(m_mid):
+            break
+        if m_mid > margin:
+            low = mid # Gap is too big, move to higher currents
+        else:
+            high = mid # Gap is too small, move to lower currents
+        if abs(m_mid - margin) < 0.001:
+            break
+            
+    return mid, f"⚠️ Margin drops below 100ms at {mid:.0f} A"
+
 
 # --- UI INJECTION ---
 st.sidebar.header("🎨 UI Settings")
@@ -92,14 +136,59 @@ if st.sidebar.button("💾 Add Relay to Database", type="primary"):
 st.divider()
 
 # --- DATABASE TABLE ---
-st.subheader("Coordination Database")
-if not db_df.empty:
-    st.markdown("✏️ *Double-click cells to edit. Select a row's checkbox to delete it.*")
-    edited_df = st.data_editor(db_df, num_rows="dynamic", use_container_width=True)
-    if st.button("🔄 Commit Table Changes"):
-        save_db(edited_df)
-        st.success("Database updated successfully!")
-        st.rerun()
+col_table, col_calc = st.columns([2, 1])
+
+with col_table:
+    st.subheader("Coordination Database")
+    if not db_df.empty:
+        st.markdown("✏️ *Double-click cells to edit. Select a row's checkbox to delete it.*")
+        edited_df = st.data_editor(db_df, num_rows="dynamic", use_container_width=True)
+        if st.button("🔄 Commit Table Changes"):
+            save_db(edited_df)
+            st.success("Database updated successfully!")
+            st.rerun()
+    else:
+        st.info("The database is empty. Add a relay configuration to view the TCC plot.")
+
+# --- MARGIN ANALYTICS & HIGH-SET CALCULATOR ---
+with col_calc:
+    st.subheader("🔍 Margin Analytics")
+    st.markdown("Calculate the exact fault current where the 100ms grading gap breaks.")
+    
+    if not db_df.empty and len(db_df) >= 2:
+        relay_options = [f"{row['Substation']} - {row['Feeder']} ({row['Voltage']})" for _, row in db_df.iterrows()]
+        
+        up_selection = st.selectbox("Select Upstream Relay", relay_options, index=0)
+        down_selection = st.selectbox("Select Downstream Relay", relay_options, index=1)
+        
+        if st.button("Calculate High-Set Limit"):
+            up_idx = relay_options.index(up_selection)
+            down_idx = relay_options.index(down_selection)
+            
+            up_row = db_df.iloc[up_idx]
+            down_row = db_df.iloc[down_idx]
+            
+            limit_amps, message = calculate_high_set_limit(up_row, down_row)
+            
+            if limit_amps:
+                st.error(message)
+                st.markdown(f"""
+                **Recommendation:**
+                Set the Instantaneous (High-Set) pick-up on **{down_row['Feeder']}** to **≤ {limit_amps:.0f} A**. 
+                If a fault exceeds this value, the IDMT delay is bypassed, ensuring it clears before the upstream relay reacts.
+                """)
+                
+                # Store the limit in session state so we can draw it on the plot
+                st.session_state['hs_limit'] = limit_amps
+                st.session_state['hs_down_v'] = parse_voltage(down_row["Voltage"])
+            else:
+                st.info(message)
+                if 'hs_limit' in st.session_state:
+                    del st.session_state['hs_limit']
+    else:
+        st.warning("Save at least two relays to the database to use this feature.")
+
+st.divider()
 
 # --- MULTI-CURVE PLOTTING ---
 st.subheader("TCC Coordination Plot")
@@ -116,17 +205,13 @@ if not db_df.empty:
     
     for _, row in db_df.iterrows():
         row_v_val = parse_voltage(row["Voltage"])
-        
-        # Fallback in case old curve names are still in the CSV
         c_const = CURVE_CONSTANTS.get(row["Curve"], 0.0607) 
         
         x_vals = []
         y_vals = []
 
         for fc_base in base_plot_currents:
-            # Reflect fault current based on voltage level
             fc_relay = fc_base * (base_v_val / row_v_val)
-            
             t_idmt = calc_time(fc_relay, row["Pick-up (A)"], row["TMS"], c_const)
             
             if not np.isnan(t_idmt):
@@ -141,6 +226,20 @@ if not db_df.empty:
             hovertemplate="Fault: %{x:.0f} A<br>Time: %{y:.3f} s<extra></extra>"
         ))
 
+    # If the user calculated a High-Set limit, draw it on the plot
+    if 'hs_limit' in st.session_state:
+        # Reflect the limit to the current chart base voltage
+        hs_limit_base = st.session_state['hs_limit'] * (st.session_state['hs_down_v'] / base_v_val)
+        
+        fig.add_vline(
+            x=hs_limit_base, 
+            line_dash="dash", 
+            line_color="red", 
+            annotation_text=" 100ms Margin Break Limit", 
+            annotation_position="top right",
+            annotation_font_color="red"
+        )
+
     fig.update_layout(
         template=plot_template,
         xaxis_title=f"Fault Current (Amps) - Referred to {plot_base_str} Base",
@@ -153,5 +252,3 @@ if not db_df.empty:
     )
     
     st.plotly_chart(fig, use_container_width=True)
-else:
-    st.info("The database is empty. Add a relay configuration to view the TCC plot.")
