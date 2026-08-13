@@ -200,9 +200,20 @@ with col_calc:
                 
             st.markdown("### Earth Fault (EF)")
             if limit_ef:
-                st.error(msg_ef)
-                st.markdown(f"**Recommendation:** Set EF Instantaneous pick-up ≤ **{limit_ef:.0f} A**.")
-                st.session_state['hs_limit_ef'] = limit_ef
+                # NEW LOGIC: Practical Engineering Constraint applied here
+                if limit_oc and limit_ef > limit_oc:
+                    practical_limit_ef = limit_oc
+                    st.error(f"⚠️ EF Margin mathematically drops below 100ms at {limit_ef:.0f} A")
+                    st.markdown(f"""
+                    **Recommendation:** Set EF Instantaneous pick-up ≤ **{practical_limit_ef:.0f} A**.
+                    
+                    *(Note: Although the EF curves mathematically coordinate up to {limit_ef:.0f} A, the relay will trip on OC Instantaneous for any earth fault exceeding {limit_oc:.0f} A. Therefore, the practical EF High-Set recommendation is capped by the OC limit).*
+                    """)
+                    st.session_state['hs_limit_ef'] = practical_limit_ef
+                else:
+                    st.error(msg_ef)
+                    st.markdown(f"**Recommendation:** Set EF Instantaneous pick-up ≤ **{limit_ef:.0f} A**.")
+                    st.session_state['hs_limit_ef'] = limit_ef
             else:
                 st.warning(msg_ef)
                 if 'hs_limit_ef' in st.session_state: del st.session_state['hs_limit_ef']
@@ -237,7 +248,7 @@ if not db_df.empty:
         tms_val = row[f"{fault_type_key} TMS"]
         
         if pd.isna(pu_val) or pd.isna(tms_val):
-            continue # Skip plotting if parameters are missing
+            continue 
         
         x_vals = []
         y_vals = []
@@ -258,7 +269,6 @@ if not db_df.empty:
             hovertemplate="Fault: %{x:.0f} A<br>Time: %{y:.3f} s<extra></extra>"
         ))
 
-    # Draw High-Set limit line if calculated
     limit_key = 'hs_limit_oc' if fault_type_key == "OC" else 'hs_limit_ef'
     if limit_key in st.session_state:
         hs_limit_base = st.session_state[limit_key] * (st.session_state['hs_down_v'] / base_v_val)
