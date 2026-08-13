@@ -15,8 +15,8 @@ if not st.session_state.accepted_terms:
     st.title("⚡ Protection Relay Coordination Tool")
     st.markdown("### Welcome, Pallav.")
     st.markdown("""
-    **New Feature:** Transformer Reflection & Common Base Plotting. 
-    The app now automatically applies the voltage transformation ratio (e.g., $11/33 = 0.333$) when grading across power transformers, ensuring the upstream relay calculates its TMS based on the *actual* reflected fault current it sees.
+    **New Feature:** Expanded Curve Support. 
+    The calculation engine now uses universal IEEE and IEC equations. You can dynamically select Moderately, Very, or Extremely Inverse curves according to standard IEEE/IEC parameters.
     """)
     if st.button("I Accept and Understand"):
         st.session_state.accepted_terms = True
@@ -37,14 +37,20 @@ def load_db():
 def save_db(dataframe):
     dataframe.to_csv(DATA_FILE, index=False)
 
-# --- CORE MATH LOGIC ---
+# --- CORE MATH LOGIC (Universal IEEE/IEC Formula) ---
 CURVE_CONSTANTS = {
-    "Standard Inverse (1.3 Sec)": 0.0607,
-    "Very Inverse (3.0 Sec)": 0.14
+    # IEC Curves (B = 0)
+    "IEC Standard Inverse (1.3s)": {"A": 0.0607, "p": 0.02, "B": 0.0},
+    "IEC Normal Inverse (3.0s)": {"A": 0.14, "p": 0.02, "B": 0.0},
+    "IEC Very Inverse": {"A": 13.5, "p": 1.0, "B": 0.0},
+    "IEC Extremely Inverse": {"A": 80.0, "p": 2.0, "B": 0.0},
+    # IEEE Curves
+    "IEEE Moderately Inverse": {"A": 0.0515, "p": 0.02, "B": 0.1140},
+    "IEEE Very Inverse": {"A": 19.61, "p": 2.0, "B": 0.491},
+    "IEEE Extremely Inverse": {"A": 28.2, "p": 2.0, "B": 0.1217}
 }
 
 def parse_voltage(v_str):
-    """Extracts numeric voltage from string (e.g., '33 kV' -> 33.0)"""
     try:
         return float(v_str.lower().replace("kv", "").strip())
     except:
@@ -55,24 +61,38 @@ def calc_psm(fault_current, pickup_current):
         return 0
     return fault_current / pickup_current
 
-def calc_time(psm, tms, curve_constant):
+def calc_time(psm, tms, curve_params):
     if psm <= 1.0 or not tms:
         return np.nan 
-    return (curve_constant / ((psm ** 0.02) - 1)) * tms
+    return tms * ((curve_params["A"] / ((psm ** curve_params["p"]) - 1)) + curve_params["B"])
 
-def calc_required_tms(target_time, psm, curve_constant):
+def calc_required_tms(target_time, psm, curve_params):
     if psm <= 1.0:
         return 0.0
-    return target_time / (curve_constant / ((psm ** 0.02) - 1))
+    return target_time / ((curve_params["A"] / ((psm ** curve_params["p"]) - 1)) + curve_params["B"])
 
-def calc_inst_pickup(target_time, tms, pickup_current, curve_constant):
+def calc_inst_pickup(target_time, tms, pickup_current, curve_params):
     if target_time <= 0 or not tms or not pickup_current:
         return np.nan
+    
+    val = (target_time / tms) - curve_params["B"]
+    if val <= 0:
+        return np.nan # Inst grading impossible at this time limit without intersecting curves
+        
     try:
-        val = (curve_constant * tms / target_time) + 1
-        return (val ** 50) * pickup_current
+        psm = (curve_params["A"] / val + 1) ** (1 / curve_params["p"])
+        return psm * pickup_current
     except OverflowError:
         return np.nan
+
+def get_curve_params(curve_name):
+    """Fallback handler for older database entries"""
+    if curve_name == "1.3s":
+        return CURVE_CONSTANTS["IEC Standard Inverse (1.3s)"]
+    elif curve_name == "3.0s":
+        return CURVE_CONSTANTS["IEC Normal Inverse (3.0s)"]
+    return CURVE_CONSTANTS.get(curve_name, CURVE_CONSTANTS["IEC Normal Inverse (3.0s)"])
+
 
 # --- UI INJECTION ---
 st.sidebar.header("🎨 UI Settings")
@@ -103,8 +123,11 @@ st.sidebar.header("3. Time Grading & TMS")
 tms_mode = st.sidebar.radio("TMS Mode", ["Manual Entry", "Auto-Coordinate (100ms Margin)"])
 
 coord_dir = st.sidebar.radio(
-    "Coordination Direction", 
-    ["Towards Downstream (This relay is Upstream)", "Towards Upstream (This relay is Downstream)"],
+    "Grading Direction", 
+    [
+        "Reference is Downstream (Make this relay 100ms SLOWER)", 
+        "Reference is Upstream (Make this relay 100ms FASTER)"
+    ],
     disabled=(tms_mode == "Manual Entry")
 )
 
@@ -112,6 +135,7 @@ tms = None
 target_margin_time = 0.100 
 fault_current = None
 current_v_val = parse_voltage(voltage_level)
+selected_curve_params = CURVE_CONSTANTS[curve_type]
 
 if tms_mode == "Manual Entry":
     fault_current = st.sidebar.number_input("Expected Fault Current (A)", min_value=10.0, value=None, step=100.0)
@@ -124,9 +148,8 @@ else:
         ref_sub, ref_feed = selected_ref.split(" - ", 1)
         ref_relay = db_df[(db_df['Substation'] == ref_sub) & (db_df['Feeder'] == ref_feed)].iloc[0]
         ref_v_val = parse_voltage(ref_relay["Voltage"])
-        ref_c_const = CURVE_CONSTANTS["Standard Inverse (1.3 Sec)"] if "1.3" in ref_relay["Curve"] else CURVE_CONSTANTS["Very Inverse (3.0 Sec)"]
+        ref_c_const = get_curve_params(ref_relay["Curve"])
         
-        # Determine the transformation ratio
         trans_ratio = ref_v_val / current_v_val
         
         if pd.notna(ref_relay.get("Inst (A)")) and ref_relay["Inst (A)"] > 0:
@@ -139,7 +162,6 @@ else:
             ref_time = calc_time(ref_psm, ref_relay["TMS"], ref_c_const)
             st.sidebar.info(f"📊 Reference Fault Current: **{auto_fault} A** at {ref_relay['Voltage']}")
 
-        # Reflect the fault current across the transformer to this relay's voltage level
         referred_fault = auto_fault * trans_ratio
         
         if trans_ratio != 1.0:
@@ -149,14 +171,18 @@ else:
             
         if pickup_current:
             if not np.isnan(ref_time):
-                target_time = ref_time + target_margin_time if "Towards Downstream" in coord_dir else ref_time - target_margin_time
+                
+                if "SLOWER" in coord_dir:
+                    target_time = ref_time + target_margin_time 
+                else:
+                    target_time = ref_time - target_margin_time
                 
                 if target_time <= 0:
                     st.sidebar.error("Target time <= 0. Upstream relay trips too fast to coordinate against.")
                 else:
                     current_psm = calc_psm(fault_current, pickup_current)
                     if current_psm > 1.0:
-                        tms = calc_required_tms(target_time, current_psm, CURVE_CONSTANTS[curve_type])
+                        tms = calc_required_tms(target_time, current_psm, selected_curve_params)
                         st.sidebar.success(f"Required TMS: {tms:.4f} (Target Trip: {target_time:.3f}s)")
                     else:
                         st.sidebar.error("Current PSM <= 1. Will not trip.")
@@ -177,7 +203,7 @@ if enable_inst:
     
     recommended_inst = np.nan
     if tms and pickup_current:
-        recommended_inst = calc_inst_pickup(0.100, tms, pickup_current, CURVE_CONSTANTS[curve_type])
+        recommended_inst = calc_inst_pickup(0.100, tms, pickup_current, selected_curve_params)
         if not np.isnan(recommended_inst):
             st.sidebar.info(f"💡 **Recommended Inst Pick-up:** {recommended_inst:.0f} A")
             
@@ -190,7 +216,7 @@ current_op_time = np.nan
 if fault_current and pickup_current:
     current_psm = calc_psm(fault_current, pickup_current)
     if tms:
-        current_op_time = calc_time(current_psm, tms, CURVE_CONSTANTS[curve_type])
+        current_op_time = calc_time(current_psm, tms, selected_curve_params)
         if enable_inst and inst_pickup and fault_current >= inst_pickup:
             current_op_time = inst_time
 
@@ -209,7 +235,7 @@ if st.button("💾 Add Relay to Database", type="primary"):
         new_row = pd.DataFrame([{
             "Substation": substation, "Feeder": feeder, "Voltage": voltage_level,
             "CT (A)": ct_rating, "Fault (A)": fault_current, "Pick-up (A)": pickup_current,
-            "Curve": "1.3s" if "1.3" in curve_type else "3.0s", "TMS": round(tms, 4),
+            "Curve": curve_type, "TMS": round(tms, 4),
             "Op Time (s)": round(current_op_time, 3) if not np.isnan(current_op_time) else "No Trip",
             "Inst (A)": round(inst_pickup, 1) if inst_pickup else np.nan,
             "Inst Time (s)": inst_time if inst_pickup else np.nan
@@ -239,12 +265,11 @@ if not db_df.empty:
     base_v_val = parse_voltage(plot_base_str)
     
     fig = go.Figure()
-    # Plot array based on the chosen Chart Base Voltage
     base_plot_currents = np.linspace(10, 25000, 1000) 
     
     for _, row in db_df.iterrows():
         row_v_val = parse_voltage(row["Voltage"])
-        c_const = CURVE_CONSTANTS["Standard Inverse (1.3 Sec)"] if row["Curve"] == "1.3s" else CURVE_CONSTANTS["Very Inverse (3.0 Sec)"]
+        c_const = get_curve_params(row["Curve"])
         
         x_vals = []
         y_vals = []
@@ -257,7 +282,6 @@ if not db_df.empty:
             if has_inst and fc_base > inst_a_base:
                 continue 
             
-            # What current does the relay actually see for this base current?
             fc_relay = fc_base * (base_v_val / row_v_val)
             t_idmt = calc_time(calc_psm(fc_relay, row["Pick-up (A)"]), row["TMS"], c_const)
             
@@ -266,7 +290,6 @@ if not db_df.empty:
                 y_vals.append(t_idmt)
 
         if has_inst and inst_a_base in base_plot_currents:
-            # Connect IDMT curve to Instantaneous drop
             t_idmt_at_inst = calc_time(calc_psm(inst_a_relay, row["Pick-up (A)"]), row["TMS"], c_const)
             x_vals.append(inst_a_base)
             y_vals.append(t_idmt_at_inst) 
