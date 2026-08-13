@@ -10,7 +10,7 @@ st.set_page_config(page_title="DISCOM Relay Coordination", layout="wide")
 st.title("⚡ Protection Relay Time Grading (OC & EF)")
 st.markdown("""
 This version implements dual-element grading. Because Earth Faults (EF) have significantly lower pick-up values, solid ground faults generate extreme PSMs. 
-You must grade Overcurrent (OC) and Earth Fault (EF) elements independently to prevent racing.
+You must grade Overcurrent (OC) and Earth Fault (EF) elements independently to prevent racing. (This webapp was prepared by Pallav Kumar Swarnkar EE MPEZ)
 """)
 
 # --- DATABASE LOGIC ---
