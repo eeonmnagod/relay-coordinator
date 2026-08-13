@@ -65,7 +65,6 @@ def calculate_high_set_limit(up_row, down_row, margin=0.100, max_fc=50000):
             return np.nan
         return t_u - t_d
 
-    # Find where both relays are operating
     min_i_down = down_row["Pick-up (A)"] * 1.05
     min_i_up_referred = (up_row["Pick-up (A)"] / trans_ratio) * 1.05
     low = max(min_i_down, min_i_up_referred)
@@ -75,26 +74,25 @@ def calculate_high_set_limit(up_row, down_row, margin=0.100, max_fc=50000):
     m_high = get_margin(high)
 
     if np.isnan(m_low):
-        return None, "Relays do not operate at low fault currents. Check Pick-up values."
+        return None, trans_ratio, "Relays do not operate at low fault currents. Check Pick-up values."
     if m_low < margin:
-        return None, f"Grading Failed: Margin is already {m_low*100:.0f}ms (below 100ms) near pick-up."
+        return None, trans_ratio, f"Grading Failed: Margin is already {m_low*100:.0f}ms (below 100ms) near pick-up."
     if m_high > margin:
-        return None, f"Margin remains > 100ms up to {max_fc} A. No High-Set required."
+        return None, trans_ratio, f"Margin remains > 100ms up to {max_fc} A. No High-Set required."
 
-    # Binary search for the exact 100ms crossing point
     for _ in range(100):
         mid = (low + high) / 2
         m_mid = get_margin(mid)
         if np.isnan(m_mid):
             break
         if m_mid > margin:
-            low = mid # Gap is too big, move to higher currents
+            low = mid 
         else:
-            high = mid # Gap is too small, move to lower currents
+            high = mid 
         if abs(m_mid - margin) < 0.001:
             break
             
-    return mid, f"⚠️ Margin drops below 100ms at {mid:.0f} A"
+    return mid, trans_ratio, f"⚠️ Margin drops below 100ms at {mid:.0f} A"
 
 
 # --- UI INJECTION ---
@@ -115,7 +113,7 @@ ct_rating = st.sidebar.number_input("CT Rating (Primary Amps)", min_value=10.0, 
 
 st.sidebar.header("2. Relay Operating Parameters")
 curve_type = st.sidebar.selectbox("Curve Type", list(CURVE_CONSTANTS.keys()))
-pickup_current = st.sidebar.number_input("Pick-up Current (A) [y]", min_value=1.0, step=10.0, value=None)
+pickup_current = st.sidebar.number_input("Pick-up Current (A) [y]", min_value=1.0, step=5.0, value=None)
 tms = st.sidebar.number_input("TMS", min_value=0.01, step=0.01, value=None)
 
 # Save to Database Button
@@ -168,7 +166,10 @@ with col_calc:
             up_row = db_df.iloc[up_idx]
             down_row = db_df.iloc[down_idx]
             
-            limit_amps, message = calculate_high_set_limit(up_row, down_row)
+            limit_amps, t_ratio, message = calculate_high_set_limit(up_row, down_row)
+            
+            if t_ratio != 1.0:
+                st.info(f"🔄 **Transformer Reflection:** Faults on the {down_row['Voltage']} bus are mathematically multiplied by **{t_ratio:.3f}** when evaluated by the {up_row['Voltage']} relay.")
             
             if limit_amps:
                 st.error(message)
@@ -178,11 +179,10 @@ with col_calc:
                 If a fault exceeds this value, the IDMT delay is bypassed, ensuring it clears before the upstream relay reacts.
                 """)
                 
-                # Store the limit in session state so we can draw it on the plot
                 st.session_state['hs_limit'] = limit_amps
                 st.session_state['hs_down_v'] = parse_voltage(down_row["Voltage"])
             else:
-                st.info(message)
+                st.warning(message)
                 if 'hs_limit' in st.session_state:
                     del st.session_state['hs_limit']
     else:
@@ -200,7 +200,6 @@ if not db_df.empty:
     
     fig = go.Figure()
     
-    # Generate a logarithmic array of fault currents [x]
     base_plot_currents = np.logspace(np.log10(10), np.log10(25000), 1000) 
     
     for _, row in db_df.iterrows():
@@ -211,7 +210,9 @@ if not db_df.empty:
         y_vals = []
 
         for fc_base in base_plot_currents:
+            # THIS LINE HANDLES THE 3-TIME DROP MATHEMATICALLY
             fc_relay = fc_base * (base_v_val / row_v_val)
+            
             t_idmt = calc_time(fc_relay, row["Pick-up (A)"], row["TMS"], c_const)
             
             if not np.isnan(t_idmt):
@@ -226,9 +227,7 @@ if not db_df.empty:
             hovertemplate="Fault: %{x:.0f} A<br>Time: %{y:.3f} s<extra></extra>"
         ))
 
-    # If the user calculated a High-Set limit, draw it on the plot
     if 'hs_limit' in st.session_state:
-        # Reflect the limit to the current chart base voltage
         hs_limit_base = st.session_state['hs_limit'] * (st.session_state['hs_down_v'] / base_v_val)
         
         fig.add_vline(
