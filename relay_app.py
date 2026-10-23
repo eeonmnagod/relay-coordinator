@@ -1,7 +1,7 @@
 import io
 import json
 import re
-from datetime import datetime, date, time
+from datetime import datetime, date
 import pytz
 import requests
 import streamlit as st
@@ -24,7 +24,6 @@ st.set_page_config(
 
 IST = pytz.timezone("Asia/Kolkata")
 
-# Your exact Google Form URL
 DEFAULT_FORM_URL = (
     "https://docs.google.com/forms/d/e/"
     "1FAIpQLSdQweoxwsCjzBOg6D5SBVirVnTyWXoLzN8u0FWHDgY5z5MGqg/viewform"
@@ -83,7 +82,6 @@ def load_google_form_schema(form_url: str) -> dict:
 
     raw_data = json.loads(match.group(1))
 
-    # Extract Form Title and Description
     form_title = "Field Data Collection Form"
     if len(raw_data) > 1 and isinstance(raw_data[1], list):
         if len(raw_data[1]) > 8 and raw_data[1][8]:
@@ -103,11 +101,6 @@ def load_google_form_schema(form_url: str) -> dict:
         else []
     )
 
-    # Group items into Sections (Type 8 = Section Header / Page Break)
-    # next_section values in Google Forms:
-    #   -1 or None -> Continue to next sequential section
-    #   -2         -> Submit form immediately after this section
-    #   > 0        -> Jump to Section with matching item_id
     sections = [
         {
             "id": 0,
@@ -127,9 +120,7 @@ def load_google_form_schema(form_url: str) -> dict:
         desc = (item[2] or "").strip()
         q_type = item[3]
 
-        # Section Break / New Page
         if q_type == 8:
-            # item[5] holds the transition rule from the PRECEDING section
             if len(item) > 5 and isinstance(item[5], int):
                 sections[-1]["next_section"] = item[5]
 
@@ -144,7 +135,6 @@ def load_google_form_schema(form_url: str) -> dict:
             )
             continue
 
-        # Informational Title / Description block
         if q_type == 6:
             sections[-1]["items"].append(
                 {
@@ -157,7 +147,6 @@ def load_google_form_schema(form_url: str) -> dict:
             )
             continue
 
-        # Standard Question Item
         if len(item) > 4 and isinstance(item[4], list) and len(item[4]) > 0:
             q_meta = item[4][0]
             entry_id = q_meta[0]
@@ -182,7 +171,6 @@ def load_google_form_schema(form_url: str) -> dict:
                     }
                 )
 
-            # Scale metadata (for Linear Scale q_type == 5)
             scale_labels = (
                 q_meta[3] if (len(q_meta) > 3 and isinstance(q_meta[3], list)) else ["", ""]
             )
@@ -280,8 +268,7 @@ def upload_to_drive(drive_service, file_buffer: io.BytesIO, filename: str, folde
 def save_response_to_sheet(gc, sheet_id: str, worksheet_name: str, record: dict):
     """
     Dynamically match or create column headers in Row 1 of the Google Sheet
-    and append the submitted record. Consolidates identical question titles
-    from different conditional branches into a single clean column.
+    and append the submitted record.
     """
     sh = gc.open_by_key(sheet_id)
     try:
@@ -295,7 +282,6 @@ def save_response_to_sheet(gc, sheet_id: str, worksheet_name: str, record: dict)
         existing_headers = list(record.keys())
         ws.append_row(existing_headers, value_input_option="USER_ENTERED")
     else:
-        # Check if any new question fields need to be added to Row 1
         header_map_lower = {h.strip().lower(): h for h in existing_headers}
         new_cols = []
         for key in record.keys():
@@ -311,7 +297,6 @@ def save_response_to_sheet(gc, sheet_id: str, worksheet_name: str, record: dict)
                 value_input_option="USER_ENTERED",
             )
 
-    # Align values to the sheet's header order
     record_lower = {k.strip().lower(): v for k, v in record.items()}
     row_values = [record_lower.get(col.strip().lower(), "") for col in existing_headers]
     ws.append_row(row_values, value_input_option="USER_ENTERED")
@@ -342,22 +327,18 @@ def render_question(q: dict) -> tuple[any, int | None]:
     has_branching = q.get("has_branching", False)
     branch_target = None
 
-    # 0 = Short Answer
     if q_type == 0:
         val = st.text_input(label, help=desc if desc else None, key=f"q_{q_id}")
         return val.strip(), None
 
-    # 1 = Paragraph
     if q_type == 1:
         val = st.text_area(label, help=desc if desc else None, key=f"q_{q_id}")
         return val.strip(), None
 
-    # 2 = Multiple Choice (Radio) | 3 = Dropdown (Selectbox)
     if q_type in (2, 3):
         opt_labels = [
             "Other (Specify below)" if o["is_other"] else o["label"] for o in options
         ]
-        # Add placeholder so conditional sections wait until an option is chosen
         display_options = ["-- Select --"] + opt_labels
 
         if q_type == 2 and len(opt_labels) <= 6 and not has_branching:
@@ -390,7 +371,6 @@ def render_question(q: dict) -> tuple[any, int | None]:
 
         return choice, branch_target
 
-    # 4 = Checkboxes (Multiselect)
     if q_type == 4:
         opt_labels = [
             "Other" if o["is_other"] else o["label"] for o in options
@@ -410,7 +390,6 @@ def render_question(q: dict) -> tuple[any, int | None]:
             ]
         return ", ".join(selected_list), None
 
-    # 5 = Linear Scale
     if q_type == 5:
         nums = [int(o["label"]) for o in options if o["label"].isdigit()]
         min_v, max_v = (min(nums), max(nums)) if nums else (1, 5)
@@ -423,21 +402,18 @@ def render_question(q: dict) -> tuple[any, int | None]:
         )
         return str(val), None
 
-    # 9 = Date
     if q_type == 9:
         val = st.date_input(
             label, value=date.today(), help=desc if desc else None, key=f"q_{q_id}"
         )
         return val.strftime("%m/%d/%Y") if val else "", None
 
-    # 10 = Time
     if q_type == 10:
         val = st.time_input(
             label, value=datetime.now(IST).time(), help=desc if desc else None, key=f"q_{q_id}"
         )
         return val.strftime("%H:%M") if val else "", None
 
-    # Fallback for any other input type
     val = st.text_input(label, help=desc if desc else None, key=f"q_{q_id}")
     return val.strip(), None
 
@@ -492,7 +468,7 @@ answers = {}
 missing_required = []
 visited_sections = set()
 current_idx = 0
- awaiting_branch_choice = False
+awaiting_branch_choice = False
 
 while (
     current_idx is not None
@@ -513,7 +489,6 @@ while (
     for q in sec["items"]:
         ans, branch_to = render_question(q)
         if q["type"] != 6:
-            # Store non-empty answers (or initialize key if not already set by an earlier section)
             if ans != "" or q["title"] not in answers:
                 answers[q["title"]] = ans
 
@@ -526,12 +501,10 @@ while (
                 elif branch_to is not None:
                     section_branch_target = branch_to
 
-    # Pause rendering further sections if a branching question in this section isn't answered yet
     if section_has_unanswered_branch:
         awaiting_branch_choice = True
         break
 
-    # Determine next section based on option branch override or section default
     target = (
         section_branch_target
         if section_branch_target is not None
@@ -539,7 +512,6 @@ while (
     )
 
     if target == -2:
-        # -2 in Google Forms means "Submit form" after this section
         break
     elif target in sec_id_to_idx:
         current_idx = sec_id_to_idx[target]
@@ -606,7 +578,6 @@ else:
                         "worksheet_name", "Form Responses 1"
                     )
 
-                    # Build concise summary lines from the first 2 answered questions for watermark
                     summary_pairs = [
                         f"{k}: {v}" for k, v in list(answers.items())[:2] if v
                     ]
@@ -625,7 +596,6 @@ else:
                         link = upload_to_drive(drive_service, wm_buf, fname, folder_id)
                         drive_links.append(link)
 
-                    # Construct complete row dictionary
                     record = {"Timestamp": timestamp_str}
                     record.update(answers)
                     record["Latitude"] = round(lat, 6)
