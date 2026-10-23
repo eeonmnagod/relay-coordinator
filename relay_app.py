@@ -1,196 +1,649 @@
-import math
-import csv
-from datetime import datetime
-import plotly.graph_objects as go
-from plotly.subplots import make_subplots
+import io
+import json
+import re
+from datetime import datetime, date, time
+import pytz
+import requests
+import streamlit as st
+import pandas as pd
+from PIL import Image, ImageDraw, ImageFont
+from streamlit_js_eval import get_geolocation
+import gspread
+from google.oauth2.service_account import Credentials
+from googleapiclient.discovery import build
+from googleapiclient.http import MediaIoBaseUpload
 
-# 1. Standard IDMT Curve Constants
-CURVE_CONSTANTS = {
-    "1.3 Sec curve": 0.0607,
-    "3.0 Sec curve": 0.14
-}
+# ==========================================
+# CONFIGURATION
+# ==========================================
+st.set_page_config(
+    page_title="Field Data & Geotagged Photo Portal",
+    page_icon="📍",
+    layout="centered",
+)
 
-def parse_voltage_kv(v_str):
-    """Extracts numerical kV value from string (e.g., '33 kV' -> 33.0)."""
-    try:
-        return float(str(v_str).lower().replace("kv", "").strip())
-    except ValueError:
-        return 11.0
+IST = pytz.timezone("Asia/Kolkata")
 
-def calc_idmt_time(fault_current, pickup_current, tms, curve_constant):
-    """Calculates IDMT relay operating time in seconds."""
-    if not pickup_current or pickup_current <= 0 or not tms or tms <= 0:
-        return None
-    psm = fault_current / pickup_current
-    if psm <= 1.0:
-        return None
-    return (curve_constant / ((psm ** 0.02) - 1.0)) * tms
+# Your exact Google Form URL
+DEFAULT_FORM_URL = (
+    "https://docs.google.com/forms/d/e/"
+    "1FAIpQLSdQweoxwsCjzBOg6D5SBVirVnTyWXoLzN8u0FWHDgY5z5MGqg/viewform"
+)
 
-def calculate_ptr_ngr_limits(v_ll_kv, ngr_ohms, ct_primary, sensitivity_factor=0.20):
+SCOPES = [
+    "https://www.googleapis.com/auth/spreadsheets",
+    "https://www.googleapis.com/auth/drive",
+]
+
+
+# ==========================================
+# GOOGLE CLOUD AUTHENTICATION
+# ==========================================
+@st.cache_resource
+def get_gcp_clients():
+    """Authenticate with Google Sheets and Google Drive via Service Account."""
+    creds_dict = dict(st.secrets["gcp_service_account"])
+    creds = Credentials.from_service_account_info(creds_dict, scopes=SCOPES)
+    gc = gspread.authorize(creds)
+    drive_service = build("drive", "v3", credentials=creds)
+    return gc, drive_service
+
+
+# ==========================================
+# GOOGLE FORM PARSER (FB_PUBLIC_LOAD_DATA_)
+# ==========================================
+@st.cache_data(ttl=600)
+def load_google_form_schema(form_url: str) -> dict:
     """
-    Calculates restricted Earth Fault parameters based on PTR Neutral Earth Resistance (NGR).
-    Returns V_LN, Max EF Current, Recommended EF Pickup (Primary A), and Plug Setting (%).
+    Fetch the Google Form viewform HTML, extract FB_PUBLIC_LOAD_DATA_,
+    and parse all sections, questions, options, and conditional branching rules.
     """
-    v_ln_volts = (v_ll_kv * 1000.0) / math.sqrt(3)
-    
-    if ngr_ohms and ngr_ohms > 0:
-        max_ef_current = v_ln_volts / ngr_ohms
-        rec_ef_pickup = max_ef_current * sensitivity_factor
-    else:
-        # Solidly grounded neutral (no intentional NGR limit)
-        max_ef_current = None
-        rec_ef_pickup = ct_primary * sensitivity_factor
-
-    plug_setting_pct = (rec_ef_pickup / ct_primary) * 100.0 if ct_primary > 0 else 0.0
-
-    return {
-        "v_ln_volts": round(v_ln_volts, 2),
-        "max_ef_current_A": round(max_ef_current, 2) if max_ef_current else None,
-        "recommended_ef_pickup_A": round(rec_ef_pickup, 2),
-        "recommended_plug_pct": round(plug_setting_pct, 2)
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/128.0.0.0 Safari/537.36"
+        )
     }
+    resp = requests.get(form_url, headers=headers, timeout=15)
+    resp.raise_for_status()
+    html = resp.text
 
-def calculate_high_set_limit(
-    up_pickup, up_tms, up_curve_const,
-    down_pickup, down_tms, down_curve_const,
-    margin=0.1, max_fault_ceiling=25000.0
-):
-    """
-    Uses bisection search to find the minimum fault current (High Set threshold)
-    where (Upstream Time - Downstream Time) drops to the 100ms (0.1s) grading margin.
-    """
-    low = max(up_pickup, down_pickup) * 1.01
-    high = max_fault_ceiling if max_fault_ceiling else 25000.0
+    match = re.search(
+        r"var\s+FB_PUBLIC_LOAD_DATA_\s*=\s*(\[.*?\]);\s*</script>",
+        html,
+        re.DOTALL,
+    )
+    if not match:
+        raise ValueError(
+            "Could not extract FB_PUBLIC_LOAD_DATA_ from the Google Form. "
+            "In Google Forms Settings, ensure 'Limit to 1 response' and native "
+            "'File Upload' questions are turned OFF so the form can be read publicly."
+        )
 
-    if low >= high:
-        return None
+    raw_data = json.loads(match.group(1))
 
-    mid = low
-    for _ in range(100):
-        mid = (low + high) / 2.0
-        t_up = calc_idmt_time(mid, up_pickup, up_tms, up_curve_const)
-        t_down = calc_idmt_time(mid, down_pickup, down_tms, down_curve_const)
+    # Extract Form Title and Description
+    form_title = "Field Data Collection Form"
+    if len(raw_data) > 1 and isinstance(raw_data[1], list):
+        if len(raw_data[1]) > 8 and raw_data[1][8]:
+            form_title = raw_data[1][8]
+    if form_title == "Field Data Collection Form" and len(raw_data) > 3 and raw_data[3]:
+        form_title = raw_data[3]
 
-        if t_up is None or t_down is None:
-            low = mid + 5.0
+    form_desc = (
+        raw_data[1][0]
+        if (len(raw_data) > 1 and isinstance(raw_data[1], list) and raw_data[1][0])
+        else ""
+    )
+
+    raw_items = (
+        raw_data[1][1]
+        if (len(raw_data) > 1 and isinstance(raw_data[1], list) and len(raw_data[1]) > 1)
+        else []
+    )
+
+    # Group items into Sections (Type 8 = Section Header / Page Break)
+    # next_section values in Google Forms:
+    #   -1 or None -> Continue to next sequential section
+    #   -2         -> Submit form immediately after this section
+    #   > 0        -> Jump to Section with matching item_id
+    sections = [
+        {
+            "id": 0,
+            "title": form_title,
+            "description": form_desc,
+            "items": [],
+            "next_section": -1,
+        }
+    ]
+
+    for item in raw_items:
+        if not isinstance(item, list) or len(item) < 4:
             continue
 
-        diff = t_up - t_down
-        if abs(diff - margin) < 0.001:
-            return round(mid, 2)
-        elif diff > margin:
-            low = mid
+        item_id = item[0]
+        title = (item[1] or "").strip()
+        desc = (item[2] or "").strip()
+        q_type = item[3]
+
+        # Section Break / New Page
+        if q_type == 8:
+            # item[5] holds the transition rule from the PRECEDING section
+            if len(item) > 5 and isinstance(item[5], int):
+                sections[-1]["next_section"] = item[5]
+
+            sections.append(
+                {
+                    "id": item_id,
+                    "title": title,
+                    "description": desc,
+                    "items": [],
+                    "next_section": -1,
+                }
+            )
+            continue
+
+        # Informational Title / Description block
+        if q_type == 6:
+            sections[-1]["items"].append(
+                {
+                    "id": item_id,
+                    "title": title,
+                    "description": desc,
+                    "type": q_type,
+                    "required": False,
+                }
+            )
+            continue
+
+        # Standard Question Item
+        if len(item) > 4 and isinstance(item[4], list) and len(item[4]) > 0:
+            q_meta = item[4][0]
+            entry_id = q_meta[0]
+            raw_options = q_meta[1] if (len(q_meta) > 1 and isinstance(q_meta[1], list)) else []
+            required = bool(q_meta[2]) if len(q_meta) > 2 else False
+
+            options = []
+            has_branching = False
+            for opt in raw_options:
+                if not isinstance(opt, list):
+                    continue
+                opt_label = str(opt[0]) if opt[0] is not None else ""
+                go_to = opt[2] if (len(opt) > 2 and isinstance(opt[2], int)) else None
+                is_other = bool(opt[4]) if (len(opt) > 4 and opt[4]) else False
+                if go_to is not None:
+                    has_branching = True
+                options.append(
+                    {
+                        "label": opt_label,
+                        "go_to": go_to,
+                        "is_other": is_other,
+                    }
+                )
+
+            # Scale metadata (for Linear Scale q_type == 5)
+            scale_labels = (
+                q_meta[3] if (len(q_meta) > 3 and isinstance(q_meta[3], list)) else ["", ""]
+            )
+
+            sections[-1]["items"].append(
+                {
+                    "id": item_id,
+                    "entry_id": entry_id,
+                    "title": title,
+                    "description": desc,
+                    "type": q_type,
+                    "required": required,
+                    "options": options,
+                    "has_branching": has_branching,
+                    "scale_labels": scale_labels,
+                }
+            )
+
+    return {
+        "title": form_title,
+        "description": form_desc,
+        "sections": sections,
+    }
+
+
+# ==========================================
+# PHOTO WATERMARK & GOOGLE DRIVE UPLOAD
+# ==========================================
+def watermark_image(image_bytes: bytes, metadata_lines: list[str]) -> io.BytesIO:
+    """Stamp timestamp, GPS coordinates, and key form answers onto the photo."""
+    img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+
+    max_width = 1280
+    if img.width > max_width:
+        ratio = max_width / float(img.width)
+        img = img.resize((max_width, int(img.height * ratio)), Image.Resampling.LANCZOS)
+
+    draw = ImageDraw.Draw(img, "RGBA")
+    font = ImageFont.load_default()
+
+    padding = 12
+    line_height = 18
+    banner_height = (len(metadata_lines) * line_height) + (padding * 2)
+
+    draw.rectangle(
+        [(0, img.height - banner_height), (img.width, img.height)],
+        fill=(0, 0, 0, 175),
+    )
+
+    y = img.height - banner_height + padding
+    for line in metadata_lines:
+        draw.text((padding, y), line, fill=(255, 255, 255, 255), font=font)
+        y += line_height
+
+    buf = io.BytesIO()
+    img.save(buf, format="JPEG", quality=85)
+    buf.seek(0)
+    return buf
+
+
+def upload_to_drive(drive_service, file_buffer: io.BytesIO, filename: str, folder_id: str) -> str:
+    """Upload watermarked JPEG to Google Drive and return its shareable link."""
+    metadata = {"name": filename, "parents": [folder_id]}
+    media = MediaIoBaseUpload(file_buffer, mimetype="image/jpeg", resumable=True)
+
+    created = (
+        drive_service.files()
+        .create(
+            body=metadata,
+            media_body=media,
+            fields="id, webViewLink",
+            supportsAllDrives=True,
+        )
+        .execute()
+    )
+    file_id = created.get("id")
+
+    try:
+        drive_service.permissions().create(
+            fileId=file_id,
+            body={"type": "anyone", "role": "reader"},
+            supportsAllDrives=True,
+        ).execute()
+    except Exception:
+        pass
+
+    return created.get(
+        "webViewLink", f"https://drive.google.com/file/d/{file_id}/view?usp=sharing"
+    )
+
+
+# ==========================================
+# DYNAMIC GOOGLE SHEETS LOGGING
+# ==========================================
+def save_response_to_sheet(gc, sheet_id: str, worksheet_name: str, record: dict):
+    """
+    Dynamically match or create column headers in Row 1 of the Google Sheet
+    and append the submitted record. Consolidates identical question titles
+    from different conditional branches into a single clean column.
+    """
+    sh = gc.open_by_key(sheet_id)
+    try:
+        ws = sh.worksheet(worksheet_name)
+    except gspread.WorksheetNotFound:
+        ws = sh.add_worksheet(title=worksheet_name, rows="1000", cols="30")
+
+    existing_headers = ws.row_values(1)
+
+    if not existing_headers:
+        existing_headers = list(record.keys())
+        ws.append_row(existing_headers, value_input_option="USER_ENTERED")
+    else:
+        # Check if any new question fields need to be added to Row 1
+        header_map_lower = {h.strip().lower(): h for h in existing_headers}
+        new_cols = []
+        for key in record.keys():
+            if key.strip().lower() not in header_map_lower:
+                new_cols.append(key)
+                header_map_lower[key.strip().lower()] = key
+
+        if new_cols:
+            existing_headers.extend(new_cols)
+            ws.update(
+                range_name="A1",
+                values=[existing_headers],
+                value_input_option="USER_ENTERED",
+            )
+
+    # Align values to the sheet's header order
+    record_lower = {k.strip().lower(): v for k, v in record.items()}
+    row_values = [record_lower.get(col.strip().lower(), "") for col in existing_headers]
+    ws.append_row(row_values, value_input_option="USER_ENTERED")
+
+
+# ==========================================
+# QUESTION RENDERER WITH CONDITIONAL LOGIC
+# ==========================================
+def render_question(q: dict) -> tuple[any, int | None]:
+    """
+    Render a single Google Form question in Streamlit.
+    Returns (answer_value, branch_target_section_id).
+    """
+    q_id = q["id"]
+    q_type = q["type"]
+    title = q["title"]
+    desc = q.get("description", "")
+    req_mark = " *" if q.get("required") else ""
+    label = f"**{title}{req_mark}**"
+
+    if q_type == 6:
+        st.markdown(f"#### {title}")
+        if desc:
+            st.caption(desc)
+        return None, None
+
+    options = q.get("options", [])
+    has_branching = q.get("has_branching", False)
+    branch_target = None
+
+    # 0 = Short Answer
+    if q_type == 0:
+        val = st.text_input(label, help=desc if desc else None, key=f"q_{q_id}")
+        return val.strip(), None
+
+    # 1 = Paragraph
+    if q_type == 1:
+        val = st.text_area(label, help=desc if desc else None, key=f"q_{q_id}")
+        return val.strip(), None
+
+    # 2 = Multiple Choice (Radio) | 3 = Dropdown (Selectbox)
+    if q_type in (2, 3):
+        opt_labels = [
+            "Other (Specify below)" if o["is_other"] else o["label"] for o in options
+        ]
+        # Add placeholder so conditional sections wait until an option is chosen
+        display_options = ["-- Select --"] + opt_labels
+
+        if q_type == 2 and len(opt_labels) <= 6 and not has_branching:
+            choice = st.radio(
+                label,
+                options=display_options,
+                help=desc if desc else None,
+                key=f"q_{q_id}",
+            )
         else:
-            high = mid
+            choice = st.selectbox(
+                label,
+                options=display_options,
+                help=desc if desc else None,
+                key=f"q_{q_id}",
+            )
 
-    return round(mid, 2)
+        if choice == "-- Select --":
+            return "", None
 
-def generate_tcc_plot(up_relay, down_relay, ngr_info, oc_high_set, ef_high_set):
-    """Generates interactive side-by-side Log-Log TCC plots for OC and EF coordination."""
-    fig = make_subplots(
-        rows=1, cols=2,
-        subplot_titles=("Overcurrent (OC) Coordination", "Earth Fault (EF) Coordination (with PTR NGR)")
+        selected_idx = opt_labels.index(choice)
+        selected_opt = options[selected_idx]
+        branch_target = selected_opt.get("go_to")
+
+        if selected_opt.get("is_other"):
+            other_val = st.text_input(
+                f"Specify Other for '{title}' *", key=f"q_{q_id}_other"
+            )
+            return other_val.strip(), branch_target
+
+        return choice, branch_target
+
+    # 4 = Checkboxes (Multiselect)
+    if q_type == 4:
+        opt_labels = [
+            "Other" if o["is_other"] else o["label"] for o in options
+        ]
+        selected_list = st.multiselect(
+            label,
+            options=opt_labels,
+            help=desc if desc else None,
+            key=f"q_{q_id}",
+        )
+        if "Other" in selected_list:
+            other_val = st.text_input(
+                f"Specify Other for '{title}' *", key=f"q_{q_id}_other"
+            ).strip()
+            selected_list = [
+                other_val if item == "Other" else item for item in selected_list if item
+            ]
+        return ", ".join(selected_list), None
+
+    # 5 = Linear Scale
+    if q_type == 5:
+        nums = [int(o["label"]) for o in options if o["label"].isdigit()]
+        min_v, max_v = (min(nums), max(nums)) if nums else (1, 5)
+        val = st.slider(
+            label,
+            min_value=min_v,
+            max_value=max_v,
+            help=desc if desc else None,
+            key=f"q_{q_id}",
+        )
+        return str(val), None
+
+    # 9 = Date
+    if q_type == 9:
+        val = st.date_input(
+            label, value=date.today(), help=desc if desc else None, key=f"q_{q_id}"
+        )
+        return val.strftime("%m/%d/%Y") if val else "", None
+
+    # 10 = Time
+    if q_type == 10:
+        val = st.time_input(
+            label, value=datetime.now(IST).time(), help=desc if desc else None, key=f"q_{q_id}"
+        )
+        return val.strftime("%H:%M") if val else "", None
+
+    # Fallback for any other input type
+    val = st.text_input(label, help=desc if desc else None, key=f"q_{q_id}")
+    return val.strip(), None
+
+
+# ==========================================
+# MAIN APPLICATION UI
+# ==========================================
+form_url = st.secrets.get("app_config", {}).get("form_url", DEFAULT_FORM_URL)
+
+try:
+    schema = load_google_form_schema(form_url)
+except Exception as e:
+    st.error(f"Error loading Google Form schema: {e}")
+    st.stop()
+
+st.title(f"📋 {schema['title']}")
+if schema["description"]:
+    st.markdown(schema["description"])
+
+st.divider()
+
+# --- 1. LIVE GPS CAPTURE ---
+st.subheader("📍 1. Live Location Capture (GPS)")
+loc_data = get_geolocation(component_key="browser_gps")
+
+lat, lon, acc = None, None, None
+if loc_data and "coords" in loc_data:
+    lat = loc_data["coords"].get("latitude")
+    lon = loc_data["coords"].get("longitude")
+    acc = loc_data["coords"].get("accuracy")
+    st.success(f"GPS Locked: `{lat:.6f}, {lon:.6f}` (Accuracy: ±{acc:.1f} m)")
+    st.map(pd.DataFrame({"lat": [lat], "lon": [lon]}), zoom=15)
+else:
+    st.warning("Waiting for browser GPS permission... Please click 'Allow' when prompted.")
+
+with st.expander("Manual Coordinates Fallback (Optional)"):
+    c1, c2 = st.columns(2)
+    m_lat = c1.number_input("Latitude", value=lat if lat else 22.057400, format="%.6f")
+    m_lon = c2.number_input("Longitude", value=lon if lon else 78.938200, format="%.6f")
+    if (lat is None or lon is None) and st.checkbox("Use manual coordinates"):
+        lat, lon, acc = m_lat, m_lon, 0.0
+
+st.divider()
+
+# --- 2. DYNAMIC GOOGLE FORM SECTIONS & CONDITIONAL BRANCHING ---
+st.subheader("📝 2. Form Details")
+
+sections = schema["sections"]
+sec_id_to_idx = {sec["id"]: idx for idx, sec in enumerate(sections)}
+
+answers = {}
+missing_required = []
+visited_sections = set()
+current_idx = 0
+ awaiting_branch_choice = False
+
+while (
+    current_idx is not None
+    and 0 <= current_idx < len(sections)
+    and current_idx not in visited_sections
+):
+    visited_sections.add(current_idx)
+    sec = sections[current_idx]
+
+    if current_idx > 0 and sec["title"]:
+        st.markdown(f"### {sec['title']}")
+        if sec["description"]:
+            st.caption(sec["description"])
+
+    section_branch_target = None
+    section_has_unanswered_branch = False
+
+    for q in sec["items"]:
+        ans, branch_to = render_question(q)
+        if q["type"] != 6:
+            # Store non-empty answers (or initialize key if not already set by an earlier section)
+            if ans != "" or q["title"] not in answers:
+                answers[q["title"]] = ans
+
+            if q.get("required") and not ans:
+                missing_required.append(q["title"])
+
+            if q.get("has_branching"):
+                if not ans:
+                    section_has_unanswered_branch = True
+                elif branch_to is not None:
+                    section_branch_target = branch_to
+
+    # Pause rendering further sections if a branching question in this section isn't answered yet
+    if section_has_unanswered_branch:
+        awaiting_branch_choice = True
+        break
+
+    # Determine next section based on option branch override or section default
+    target = (
+        section_branch_target
+        if section_branch_target is not None
+        else sec.get("next_section", -1)
     )
 
-    fault_currents = [i for i in range(10, 25000, 25)]
-    max_ef = ngr_info["max_ef_current_A"]
+    if target == -2:
+        # -2 in Google Forms means "Submit form" after this section
+        break
+    elif target in sec_id_to_idx:
+        current_idx = sec_id_to_idx[target]
+    else:
+        current_idx += 1
 
-    # 1. Overcurrent Curves
-    up_oc_c = CURVE_CONSTANTS.get(up_relay["curve"], 0.14)
-    down_oc_c = CURVE_CONSTANTS.get(down_relay["curve"], 0.14)
+st.divider()
 
-    oc_x_up, oc_y_up, oc_x_down, oc_y_down = [], [], [], []
-    for fc in fault_currents:
-        t_u = calc_idmt_time(fc, up_relay["oc_pickup"], up_relay["oc_tms"], up_oc_c)
-        t_d = calc_idmt_time(fc, down_relay["oc_pickup"], down_relay["oc_tms"], down_oc_c)
-        if t_u:
-            oc_x_up.append(fc)
-            oc_y_up.append(t_u)
-        if t_d:
-            oc_x_down.append(fc)
-            oc_y_down.append(t_d)
+# --- 3. CAMERA / PHOTO CAPTURE ---
+st.subheader("📷 3. Site / Equipment Photo")
+photo_source = st.radio(
+    "Select Photo Input Method",
+    options=["Take Live Camera Photo", "Upload Photo(s) from Device"],
+    horizontal=True,
+)
 
-    fig.add_trace(go.Scatter(x=oc_x_up, y=oc_y_up, name=f"Upstream OC ({up_relay['feeder']})", line=dict(color="#0288d1", width=2)), row=1, col=1)
-    fig.add_trace(go.Scatter(x=oc_x_down, y=oc_y_down, name=f"Downstream OC ({down_relay['feeder']})", line=dict(color="#d32f2f", width=2)), row=1, col=1)
-
-    if oc_high_set:
-        fig.add_vline(x=oc_high_set, line_dash="dash", line_color="green", annotation_text=f"OC High Set: {oc_high_set}A", row=1, col=1)
-
-    # 2. Earth Fault Curves (Truncated at Max Restricted EF Current if NGR > 0)
-    ef_x_up, ef_y_up, ef_x_down, ef_y_down = [], [], [], []
-    for fc in fault_currents:
-        if max_ef and fc > max_ef:
-            break
-        t_u = calc_idmt_time(fc, up_relay["ef_pickup"], up_relay["ef_tms"], up_oc_c)
-        t_d = calc_idmt_time(fc, down_relay["ef_pickup"], down_relay["ef_tms"], down_oc_c)
-        if t_u:
-            ef_x_up.append(fc)
-            ef_y_up.append(t_u)
-        if t_d:
-            ef_x_down.append(fc)
-            ef_y_down.append(t_d)
-
-    fig.add_trace(go.Scatter(x=ef_x_up, y=ef_y_up, name=f"Upstream EF ({up_relay['feeder']})", line=dict(color="#0288d1", width=2, dash="dot")), row=1, col=2)
-    fig.add_trace(go.Scatter(x=ef_x_down, y=ef_y_down, name=f"Downstream EF ({down_relay['feeder']})", line=dict(color="#d32f2f", width=2, dash="dot")), row=1, col=2)
-
-    if max_ef:
-        fig.add_vline(x=max_ef, line_dash="solid", line_color="purple", annotation_text=f"NGR Max EF: {max_ef}A", row=1, col=2)
-    if ef_high_set:
-        fig.add_vline(x=ef_high_set, line_dash="dash", line_color="green", annotation_text=f"EF High Set: {ef_high_set}A", row=1, col=2)
-
-    fig.update_xaxes(type="log", title_text="Fault Current (A)")
-    fig.update_yaxes(type="log", title_text="Operating Time (s)")
-    fig.update_layout(title_text=f"STM Relay Coordination - {up_relay['substation']}", height=600)
-    fig.show()
-
-if __name__ == "__main__":
-    # Example Configuration: 33/11kV Substation with PTR Neutral Earth Resistance
-    upstream_ptr_lv = {
-        "substation": "CHHINDWARA_33_11KV",
-        "feeder": "11kV Main PTR Protection",
-        "voltage": "11 kV",
-        "ct_primary": 400.0,
-        "ngr_ohms": 40.0,  # PTR Neutral Earth Resistance in Ohms (0 if solidly grounded)
-        "curve": "3.0 Sec curve",
-        "oc_pickup": 300.0,
-        "oc_tms": 0.15,
-        "ef_pickup": 30.0,
-        "ef_tms": 0.12
-    }
-
-    downstream_feeder = {
-        "substation": "CHHINDWARA_33_11KV",
-        "feeder": "11kV Feeder Protection",
-        "voltage": "11 kV",
-        "ct_primary": 200.0,
-        "curve": "3.0 Sec curve",
-        "oc_pickup": 150.0,
-        "oc_tms": 0.08,
-        "ef_pickup": 20.0,
-        "ef_tms": 0.05
-    }
-
-    v_kv = parse_voltage_kv(upstream_ptr_lv["voltage"])
-    ngr_results = calculate_ptr_ngr_limits(v_kv, upstream_ptr_lv["ngr_ohms"], upstream_ptr_lv["ct_primary"])
-
-    oc_hs = calculate_high_set_limit(
-        upstream_ptr_lv["oc_pickup"], upstream_ptr_lv["oc_tms"], CURVE_CONSTANTS[upstream_ptr_lv["curve"]],
-        downstream_feeder["oc_pickup"], downstream_feeder["oc_tms"], CURVE_CONSTANTS[downstream_feeder["curve"]],
-        margin=0.1
+uploaded_photos = []
+if photo_source == "Take Live Camera Photo":
+    cam_pic = st.camera_input("Capture Photo *")
+    if cam_pic:
+        uploaded_photos = [cam_pic]
+else:
+    files = st.file_uploader(
+        "Upload Photo(s) (JPG/PNG) *",
+        type=["jpg", "jpeg", "png"],
+        accept_multiple_files=True,
     )
+    if files:
+        uploaded_photos = files
 
-    ef_hs = calculate_high_set_limit(
-        upstream_ptr_lv["ef_pickup"], upstream_ptr_lv["ef_tms"], CURVE_CONSTANTS[upstream_ptr_lv["curve"]],
-        downstream_feeder["ef_pickup"], downstream_feeder["ef_tms"], CURVE_CONSTANTS[downstream_feeder["curve"]],
-        margin=0.1,
-        max_fault_ceiling=ngr_results["max_ef_current_A"]
-    )
+st.divider()
 
-    print("=== PTR NGR & RELAY COORDINATION SUMMARY ===")
-    print(f"Phase-to-Neutral Voltage : {ngr_results['v_ln_volts']} V")
-    print(f"Max Restricted EF Current: {ngr_results['max_ef_current_A']} A")
-    print(f"Recommended EF Pickup    : {ngr_results['recommended_ef_pickup_A']} A ({ngr_results['recommended_plug_pct']}% of CT)")
-    print(f"100ms OC High-Set Limit  : {oc_hs} A")
-    print(f"100ms EF High-Set Limit  : {ef_hs} A")
+# --- 4. SUBMIT TO GOOGLE DRIVE & GOOGLE SHEETS ---
+if awaiting_branch_choice:
+    st.info("👆 Please select an option above to load the next section of the form.")
+else:
+    if st.button("✅ Submit Response", type="primary", use_container_width=True):
+        errors = []
+        if missing_required:
+            errors.append(
+                f"Please fill in all required fields: {', '.join(missing_required)}"
+            )
+        if not uploaded_photos:
+            errors.append("Please capture or upload at least one photo.")
+        if lat is None or lon is None:
+            errors.append(
+                "GPS Location is missing. Please allow browser location access or enable manual coordinates."
+            )
 
-    generate_tcc_plot(upstream_ptr_lv, downstream_feeder, ngr_results, oc_hs, ef_hs)
+        if errors:
+            for err in errors:
+                st.error(err)
+        else:
+            with st.spinner("Watermarking photo(s), uploading to Drive, and saving to Sheet..."):
+                try:
+                    now_ist = datetime.now(IST)
+                    timestamp_str = now_ist.strftime("%m/%d/%Y %H:%M:%S")
+                    maps_url = f"https://www.google.com/maps?q={lat:.6f},{lon:.6f}"
+
+                    gc, drive_service = get_gcp_clients()
+                    folder_id = st.secrets["app_config"]["drive_folder_id"]
+                    sheet_id = st.secrets["app_config"]["spreadsheet_id"]
+                    worksheet_name = st.secrets["app_config"].get(
+                        "worksheet_name", "Form Responses 1"
+                    )
+
+                    # Build concise summary lines from the first 2 answered questions for watermark
+                    summary_pairs = [
+                        f"{k}: {v}" for k, v in list(answers.items())[:2] if v
+                    ]
+                    watermark_lines = [
+                        f"Time: {timestamp_str} IST | GPS: {lat:.6f}, {lon:.6f}",
+                        " | ".join(summary_pairs)[:90] if summary_pairs else schema["title"],
+                    ]
+
+                    drive_links = []
+                    preview_buffers = []
+                    for idx, photo_file in enumerate(uploaded_photos, start=1):
+                        wm_buf = watermark_image(photo_file.getvalue(), watermark_lines)
+                        preview_buffers.append(wm_buf)
+
+                        fname = f"FieldPhoto_{now_ist.strftime('%Y%m%d_%H%M%S')}_{idx}.jpg"
+                        link = upload_to_drive(drive_service, wm_buf, fname, folder_id)
+                        drive_links.append(link)
+
+                    # Construct complete row dictionary
+                    record = {"Timestamp": timestamp_str}
+                    record.update(answers)
+                    record["Latitude"] = round(lat, 6)
+                    record["Longitude"] = round(lon, 6)
+                    record["Accuracy (m)"] = round(acc, 1) if acc else ""
+                    record["Google Maps Link"] = maps_url
+                    record["Photo Drive URL"] = " , ".join(drive_links)
+
+                    save_response_to_sheet(gc, sheet_id, worksheet_name, record)
+
+                    st.success("🎉 Response & Geotagged Photo(s) saved successfully!")
+                    st.markdown(f"- **Location Pin:** [Open in Google Maps]({maps_url})")
+                    for i, link in enumerate(drive_links, start=1):
+                        st.markdown(f"- **Uploaded Photo {i}:** [View in Google Drive]({link})")
+
+                    for buf in preview_buffers:
+                        buf.seek(0)
+                        st.image(buf, caption="Watermarked & Uploaded Photo", use_container_width=True)
+
+                except Exception as e:
+                    st.error(f"Submission failed: {e}")
