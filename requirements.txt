@@ -7,3 +7,6 @@ Pillow
 pandas
 pytz
 requests
+plotly
+pandas
+
