@@ -1,327 +1,330 @@
-import streamlit as st
-import numpy as np
+import math
 import pandas as pd
 import plotly.graph_objects as go
-import os
+from plotly.subplots import make_subplots
+import streamlit as st
 
-# --- APP SETUP ---
-st.set_page_config(page_title="DISCOM Relay Coordination", layout="wide")
-
-st.title("⚡ Protection Relay Time Grading (OC & EF)")
-st.markdown("""
-**Hierarchical Constraint Mode:** 
-This tool now enforces the "Hard Ceiling Rule". A downstream relay's High-Set will automatically be capped by its immediate upstream relay's High-Set (referred across voltage levels) to prevent racing and maintain selectivity.
-""")
-
-# --- DATABASE LOGIC ---
-DATA_FILE = "discom_relay_database.csv"
-
-def load_db():
-    if os.path.exists(DATA_FILE):
-        return pd.read_csv(DATA_FILE)
-    return pd.DataFrame(columns=[
-        "Substation", "Feeder", "Voltage", "CT (A)", "Curve",
-        "OC Pick-up (A)", "OC TMS", "OC Inst (A)", 
-        "EF Pick-up (A)", "EF TMS", "EF Inst (A)"
-    ])
-
-def save_db(dataframe):
-    dataframe.to_csv(DATA_FILE, index=False)
-
-db_df = load_db()
-
-# --- CORE MATH LOGIC ---
+# ---------------------------------------------------------
+# 1. CONSTANTS & CORE PROTECTION MATH ENGINE
+# ---------------------------------------------------------
 CURVE_CONSTANTS = {
-    "1.3 Sec curve": 0.0607,
-    "3.0 Sec curve": 0.14
+    "3.0 Sec curve (IEC Standard Inverse)": 0.14,
+    "1.3 Sec curve (Fast Inverse)": 0.0607,
 }
 
-def calc_time(fault_current, pickup_current, tms, curve_constant):
-    if not pickup_current or pickup_current == 0 or pd.isna(pickup_current):
-        return np.nan
+def calc_idmt_time(fault_current, pickup_current, tms, curve_constant):
+    """Calculates IDMT operating time in seconds for ANSI 51 / 51N / 51G."""
+    if not pickup_current or pickup_current <= 0 or not tms or tms <= 0:
+        return None
     psm = fault_current / pickup_current
-    if psm <= 1.0 or not tms or pd.isna(tms):
-        return np.nan
-    return (curve_constant / ((psm ** 0.02) - 1)) * tms
+    if psm <= 1.0:
+        return None
+    return (curve_constant / ((psm ** 0.02) - 1.0)) * tms
 
-def parse_voltage(v_str):
-    try:
-        return float(v_str.lower().replace("kv", "").strip())
-    except:
-        return 1.0
+def calculate_ptr_parameters(v_hv_kv, v_lv_kv, ptr_mva, ptr_z_pct, ngr_ohms, ct_lv_pri, ct_hv_pri):
+    """
+    Calculates 33/11kV Dyn11 PTR Full Load Currents, 3-Phase Through-Fault Ceilings (%Z),
+    and Restricted Earth Fault Current (NGR) referred to both 11kV LV and 33kV HV sides.
+    """
+    turn_ratio = v_hv_kv / v_lv_kv  # 33 / 11 = 3.0
+    v_lv_ln_volts = (v_lv_kv * 1000.0) / math.sqrt(3)
 
-# --- NUMERICAL HIGH-SET CALCULATOR (WITH CEILING CONSTRAINTS) ---
-def calculate_high_set_limit(up_row, down_row, fault_type="OC", margin=0.100, max_fc=50000):
-    down_v = parse_voltage(down_row["Voltage"])
-    up_v = parse_voltage(up_row["Voltage"])
-    trans_ratio = down_v / up_v 
-    
-    c_down = CURVE_CONSTANTS.get(down_row["Curve"], 0.0607)
-    c_up = CURVE_CONSTANTS.get(up_row["Curve"], 0.0607)
-    
-    down_pu = down_row[f"{fault_type} Pick-up (A)"]
-    down_tms = down_row[f"{fault_type} TMS"]
-    up_pu = up_row[f"{fault_type} Pick-up (A)"]
-    up_tms = up_row[f"{fault_type} TMS"]
+    # Full Load Currents (LV & HV)
+    i_fl_lv = (ptr_mva * 1e6) / (math.sqrt(3) * v_lv_kv * 1000.0)
+    i_fl_hv = (ptr_mva * 1e6) / (math.sqrt(3) * v_hv_kv * 1000.0)
 
-    if pd.isna(down_pu) or pd.isna(up_pu):
-        return None, None, None, trans_ratio, "Pick-up parameters missing."
+    # Max 3-Phase Symmetrical Through-Fault Current (%Z Ceiling)
+    z_pu = ptr_z_pct / 100.0
+    i_sc_3ph_lv = i_fl_lv / z_pu
+    i_sc_3ph_hv = i_fl_hv / z_pu
 
-    # 1. Calculate Mathematical Convergence Limit (100ms break)
-    def get_margin(I_down):
-        I_up = I_down * trans_ratio
-        t_d = calc_time(I_down, down_pu, down_tms, c_down)
-        t_u = calc_time(I_up, up_pu, up_tms, c_up)
-        if np.isnan(t_d) or np.isnan(t_u): return np.nan
-        return t_u - t_d
+    # Dyn11 Phase-to-Phase Fault Factor on HV line (2 / sqrt(3) or 1/sqrt(3) distribution)
+    # For an 11kV L-G fault on a Star winding, Delta winding blocks zero-sequence (33kV 51N = 0A),
+    # and reflects into one HV line conductor at I_HV_line = I_LV_fault / (sqrt(3) * Turn_Ratio)
+    dyn11_lg_hv_factor = 1.0 / (math.sqrt(3) * turn_ratio)
 
-    min_i_down = down_pu * 1.05
-    min_i_up_referred = (up_pu / trans_ratio) * 1.05
-    low = max(min_i_down, min_i_up_referred)
-    high = max_fc
-    math_limit = None
-    msg = ""
-
-    m_low = get_margin(low)
-    m_high = get_margin(high)
-
-    if np.isnan(m_low):
-        msg = "Relays do not operate at low currents."
-    elif m_low < margin:
-        msg = f"Grading Fails early (margin {m_low*100:.0f}ms at pick-up)."
-    elif m_high > margin:
-        math_limit = max_fc
-        msg = f"Curves never converge < 100ms within {max_fc}A."
+    # NGR Restricted Earth Fault Current on 11kV Side
+    if ngr_ohms and ngr_ohms > 0:
+        max_ef_lv = v_lv_ln_volts / ngr_ohms
+        rec_51g_pickup = max_ef_lv * 0.20  # 20% sensitivity rule
     else:
-        for _ in range(100):
-            mid = (low + high) / 2
-            m_mid = get_margin(mid)
-            if np.isnan(m_mid): break
-            if m_mid > margin: low = mid 
-            else: high = mid 
-            if abs(m_mid - margin) < 0.001: break
-        math_limit = mid
-        msg = f"Mathematical convergence at {math_limit:.0f} A."
+        max_ef_lv = i_sc_3ph_lv  # Solidly grounded
+        rec_51g_pickup = ct_lv_pri * 0.20
 
-    # 2. Check Upstream Ceiling Constraint
-    upstream_inst = up_row.get(f"{fault_type} Inst (A)")
-    ceiling_limit = None
-    if pd.notna(upstream_inst) and upstream_inst > 0:
-        # Refer the upstream limit to the downstream voltage side
-        ceiling_limit = upstream_inst / trans_ratio
+    # Reflected 11kV Earth Fault Current seen by 33kV Phase Overcurrent (51) Relay
+    max_ef_reflected_hv_line = max_ef_lv * dyn11_lg_hv_factor
 
-    # 3. Apply the strictest constraint
-    final_limit = math_limit
-    if ceiling_limit is not None and (math_limit is None or ceiling_limit < math_limit):
-        final_limit = ceiling_limit
-        msg = f"Capped by Upstream High-Set limit."
+    return {
+        "turn_ratio": round(turn_ratio, 3),
+        "v_lv_ln_volts": round(v_lv_ln_volts, 1),
+        "i_fl_lv_A": round(i_fl_lv, 2),
+        "i_fl_hv_A": round(i_fl_hv, 2),
+        "max_3ph_sc_lv_A": round(i_sc_3ph_lv, 1),
+        "max_3ph_sc_hv_A": round(i_sc_3ph_hv, 1),
+        "max_ef_lv_A": round(max_ef_lv, 2),
+        "max_ef_reflected_hv_A": round(max_ef_reflected_hv_line, 2),
+        "rec_51g_pickup_A": round(rec_51g_pickup, 2),
+        "rec_51g_plug_pct": round((rec_51g_pickup / ct_lv_pri) * 100.0, 2),
+        "dyn11_lg_hv_factor": dyn11_lg_hv_factor
+    }
 
-    return final_limit, math_limit, ceiling_limit, trans_ratio, msg
+def calculate_high_set_bisection(
+    up_pickup, up_tms, up_c,
+    down_pickup, down_tms, down_c,
+    cti_sec=0.10, max_ceiling=25000.0
+):
+    """
+    Finds the minimum fault current (ANSI 50 / 50N threshold) where
+    (Upstream Time - Downstream Time) drops below the required Grading Margin (CTI).
+    """
+    low = max(up_pickup, down_pickup) * 1.01
+    high = float(max_ceiling)
 
+    if low >= high:
+        return None
 
-# --- UI INJECTION ---
-st.sidebar.header("🎨 UI Settings")
-dark_mode = st.sidebar.toggle("🌙 Enable Dark Mode", value=True)
-if dark_mode:
-    st.markdown("""<style>.stApp { background-color: #0E1117; color: #FAFAFA; }</style>""", unsafe_allow_html=True)
-    plot_template = "plotly_dark"
-else:
-    plot_template = "plotly_white"
+    t_up_max = calc_idmt_time(high, up_pickup, up_tms, up_c)
+    t_down_max = calc_idmt_time(high, down_pickup, down_tms, down_c)
+    if t_up_max and t_down_max and (t_up_max - t_down_max) >= cti_sec:
+        return None  # Selectivity holds all the way to the physical fault ceiling
 
-# --- SIDEBAR INPUTS ---
-st.sidebar.header("1. Feeder Details")
-substation = st.sidebar.text_input("Substation Name", placeholder="e.g. Nainpur", value=None)
-feeder = st.sidebar.text_input("Feeder Name", placeholder="e.g. 33kV PTR", value=None)
-voltage_level = st.sidebar.selectbox("Voltage Level", ["132 kV", "33 kV", "11 kV"])
-ct_rating = st.sidebar.number_input("CT Rating (Primary Amps)", min_value=10.0, step=50.0, value=None)
-curve_type = st.sidebar.selectbox("Curve Type", list(CURVE_CONSTANTS.keys()))
+    mid = low
+    for _ in range(100):
+        mid = (low + high) / 2.0
+        t_up = calc_idmt_time(mid, up_pickup, up_tms, up_c)
+        t_down = calc_idmt_time(mid, down_pickup, down_tms, down_c)
 
-st.sidebar.header("2. Phase Overcurrent (OC)")
-oc_pickup = st.sidebar.number_input("OC Pick-up (A)", min_value=1.0, step=5.0, value=None)
-oc_tms = st.sidebar.number_input("OC TMS", min_value=0.01, step=0.01, value=None)
-oc_inst = st.sidebar.number_input("OC Inst / High-Set (A) [Optional]", min_value=10.0, step=10.0, value=None)
+        if t_up is None or t_down is None:
+            low = mid + 2.0
+            continue
 
-st.sidebar.header("3. Earth Fault (EF)")
-ef_pickup = st.sidebar.number_input("EF Pick-up (A)", min_value=1.0, step=1.0, value=None)
-ef_tms = st.sidebar.number_input("EF TMS", min_value=0.01, step=0.01, value=None)
-ef_inst = st.sidebar.number_input("EF Inst / High-Set (A) [Optional]", min_value=10.0, step=10.0, value=None)
+        diff = t_up - t_down
+        if abs(diff - cti_sec) < 0.001:
+            return round(mid, 1)
+        elif diff > cti_sec:
+            low = mid
+        else:
+            high = mid
 
-# Save to Database Button
-if st.sidebar.button("💾 Add Relay to Database", type="primary"):
-    if None in [substation, feeder, ct_rating] or substation == "" or feeder == "":
-        st.sidebar.error("⚠️ Please fill out Substation, Feeder, and CT Rating.")
-    else:
-        new_row = pd.DataFrame([{
-            "Substation": substation, "Feeder": feeder, "Voltage": voltage_level,
-            "CT (A)": ct_rating, "Curve": curve_type,
-            "OC Pick-up (A)": oc_pickup, "OC TMS": round(oc_tms, 4) if oc_tms else None, "OC Inst (A)": oc_inst,
-            "EF Pick-up (A)": ef_pickup, "EF TMS": round(ef_tms, 4) if ef_tms else None, "EF Inst (A)": ef_inst
-        }])
-        updated_db = pd.concat([db_df, new_row], ignore_index=True)
-        save_db(updated_db)
-        st.sidebar.success("Added to database!")
-        st.rerun()
+    return round(mid, 1)
 
-st.divider()
+# ---------------------------------------------------------
+# 2. STREAMLIT WEB APP UI
+# ---------------------------------------------------------
+st.set_page_config(page_title="STM 3-Zone Relay Coordination", layout="wide")
+st.title("⚡ 3-Stage Protection Zone Coordination Web App (11kV ➔ PTR LV ➔ 33kV PTR HV)")
+st.markdown(
+    "Simulates **3-Zone IDMT Coordination (ANSI 50/51/51N/51G)** across a **33/11kV Dyn11 Power Transformer**, "
+    "incorporating **PTR %Z Through-Fault Ceilings**, **NGR Restricted Earth Fault Clamping**, and **Delta-Star Vector Group Phase-Shift Compensation**."
+)
 
-# --- DATABASE TABLE ---
-col_table, col_calc = st.columns([2, 1])
-
-with col_table:
-    st.subheader("Coordination Database")
-    if not db_df.empty:
-        edited_df = st.data_editor(db_df, num_rows="dynamic", use_container_width=True)
-        if st.button("🔄 Commit Table Changes"):
-            save_db(edited_df)
-            st.success("Database updated successfully!")
-            st.rerun()
-    else:
-        st.info("The database is empty. Add a relay configuration to view the TCC plot.")
-
-# --- MARGIN ANALYTICS & HIGH-SET CALCULATOR ---
-with col_calc:
-    st.subheader("🔍 Margin Analytics")
-    st.markdown("Calculate safe High-Set constraints based on Math Limits & Upstream Ceilings.")
+# Sidebar: PTR & System Parameters
+with st.sidebar:
+    st.header("1. PTR & Substation Specs")
+    substation_name = st.text_input("Substation Name", value="CHHINDWARA_33_11KV")
+    ptr_mva = st.number_input("PTR Rating (MVA)", min_value=1.0, max_value=100.0, value=8.0, step=0.5)
+    ptr_z_pct = st.number_input("PTR Impedance (%Z)", min_value=1.0, max_value=25.0, value=8.35, step=0.05)
+    ngr_ohms = st.number_input("PTR Neutral Earth Resistance (NGR Ω) [0 = Solid]", min_value=0.0, max_value=500.0, value=40.0, step=1.0)
     
-    if not db_df.empty and len(db_df) >= 2:
-        relay_options = [f"{row['Substation']} - {row['Feeder']} ({row['Voltage']})" for _, row in db_df.iterrows()]
-        
-        up_selection = st.selectbox("Select Upstream Relay", relay_options, index=0)
-        down_selection = st.selectbox("Select Downstream Relay", relay_options, index=1)
-        
-        if st.button("Calculate High-Set Limits", type="primary"):
-            up_idx = relay_options.index(up_selection)
-            down_idx = relay_options.index(down_selection)
-            
-            up_row = db_df.iloc[up_idx]
-            down_row = db_df.iloc[down_idx]
-            
-            limit_oc, math_oc, ceil_oc, t_ratio, msg_oc = calculate_high_set_limit(up_row, down_row, fault_type="OC")
-            limit_ef, math_ef, ceil_ef, _, msg_ef = calculate_high_set_limit(up_row, down_row, fault_type="EF")
-            
-            if t_ratio != 1.0:
-                st.info(f"🔄 **Transformer Reflection:** Downstream faults are multiplied by **{t_ratio:.3f}**.")
-            elif up_row['Voltage'] == down_row['Voltage']:
-                st.info(f"⚡ **Same Voltage Bus:** E.g., 33kV Outgoing graded against a downstream 33kV Substation Incoming VCB. No transformer reflection applied.")
+    st.header("2. Breaker (ANSI 52) Grading")
+    cb_open_ms = st.number_input("VCB (52) Interrupting Time (ms)", min_value=20.0, max_value=200.0, value=60.0, step=5.0)
+    overshoot_ms = st.number_input("Relay Overshoot & Safety Margin (ms)", min_value=10.0, max_value=200.0, value=40.0, step=5.0)
+    total_cti_sec = (cb_open_ms + overshoot_ms) / 1000.0
+    st.info(f"**Required Grading Margin (CTI):** `{total_cti_sec*1000:.0f} ms ({total_cti_sec:.2f} s)`")
 
-            st.markdown("---")
-            st.markdown("### Phase Overcurrent (OC)")
-            if math_oc: st.write(f"📉 **Math Limit:** {math_oc:.0f} A")
-            if ceil_oc: st.write(f"🛑 **Upstream Ceiling:** {ceil_oc:.0f} A")
-            
-            if limit_oc:
-                st.error(f"**Required Setting:** Set OC High-Set ≤ **{limit_oc:.0f} A**")
-                st.caption(msg_oc)
-                st.session_state['hs_limit_oc'] = limit_oc
-            else:
-                st.warning(msg_oc)
-                
-            st.markdown("---")
-            st.markdown("### Earth Fault (EF)")
-            if math_ef: st.write(f"📉 **Math Limit:** {math_ef:.0f} A")
-            if ceil_ef: st.write(f"🛑 **Upstream Ceiling:** {ceil_ef:.0f} A")
-            
-            if limit_ef:
-                if limit_oc and limit_ef > limit_oc:
-                    practical_limit_ef = limit_oc
-                    st.error(f"**Required Setting:** Set EF High-Set ≤ **{practical_limit_ef:.0f} A**")
-                    st.caption("*(EF constrained mathematically, but further capped by the practical OC limit).*")
-                    st.session_state['hs_limit_ef'] = practical_limit_ef
-                else:
-                    st.error(f"**Required Setting:** Set EF High-Set ≤ **{limit_ef:.0f} A**")
-                    st.caption(msg_ef)
-                    st.session_state['hs_limit_ef'] = limit_ef
-            else:
-                st.warning(msg_ef)
-                
-            st.session_state['hs_down_v'] = parse_voltage(down_row["Voltage"])
-            
-    else:
-        st.warning("Save at least two relays to the database to use this feature.")
+# Main Relay Settings Columns (3 Protection Zones)
+col1, col2, col3 = st.columns(3)
 
-st.divider()
+with col1:
+    st.subheader("Zone 1: 11kV Outgoing Feeder")
+    st.caption("Primary Protection (Downstream)")
+    fdr_ct = st.number_input("Feeder CT Primary (A)", value=200.0, step=50.0)
+    fdr_curve_name = st.selectbox("Feeder IDMT Curve", list(CURVE_CONSTANTS.keys()), index=0, key="fdr_c")
+    fdr_oc_pickup = st.number_input("Feeder 51 OC Pickup (A)", value=150.0, step=10.0)
+    fdr_oc_tms = st.number_input("Feeder 51 OC TMS", value=0.08, step=0.01, format="%.2f")
+    fdr_ef_pickup = st.number_input("Feeder 51N EF Pickup (A)", value=20.0, step=5.0)
+    fdr_ef_tms = st.number_input("Feeder 51N EF TMS", value=0.05, step=0.01, format="%.2f")
 
-# --- MULTI-CURVE PLOTTING ---
-st.subheader("TCC Coordination Plot")
-if not db_df.empty:
-    
-    colA, colB = st.columns([1, 3])
-    plot_base_str = colA.selectbox("Chart Base Voltage (For visual grading)", ["11 kV", "33 kV", "132 kV"], index=0)
-    plot_element = colB.radio("Element to Plot", ["Phase Overcurrent (OC)", "Earth Fault (EF)"], horizontal=True)
-    
-    base_v_val = parse_voltage(plot_base_str)
-    fault_type_key = "OC" if "OC" in plot_element else "EF"
-    
-    fig = go.Figure()
-    base_plot_currents = np.logspace(np.log10(10), np.log10(25000), 1000) 
-    
-    for _, row in db_df.iterrows():
-        row_v_val = parse_voltage(row["Voltage"])
-        c_const = CURVE_CONSTANTS.get(row["Curve"], 0.0607) 
-        
-        pu_val = row[f"{fault_type_key} Pick-up (A)"]
-        tms_val = row[f"{fault_type_key} TMS"]
-        inst_val = row[f"{fault_type_key} Inst (A)"]
-        
-        if pd.isna(pu_val) or pd.isna(tms_val):
-            continue 
-        
-        x_vals = []
-        y_vals = []
-        
-        inst_val_base = inst_val * (row_v_val / base_v_val) if pd.notna(inst_val) and inst_val > 0 else None
+with col2:
+    st.subheader("Zone 2: 11kV PTR LV Incomer")
+    st.caption("Local Backup (Star Winding + NGR)")
+    lv_ct = st.number_input("PTR LV CT Primary (A)", value=400.0, step=50.0)
+    lv_curve_name = st.selectbox("PTR LV IDMT Curve", list(CURVE_CONSTANTS.keys()), index=0, key="lv_c")
+    lv_oc_pickup = st.number_input("PTR LV 51 OC Pickup (A)", value=300.0, step=10.0)
+    lv_oc_tms = st.number_input("PTR LV 51 OC TMS", value=0.15, step=0.01, format="%.2f")
+    lv_ef_pickup = st.number_input("PTR Neutral 51G Pickup (A)", value=30.0, step=5.0)
+    lv_ef_tms = st.number_input("PTR Neutral 51G TMS", value=0.12, step=0.01, format="%.2f")
 
-        for fc_base in base_plot_currents:
-            if inst_val_base and fc_base > inst_val_base:
-                continue # Bypass IDMT curve plotting beyond Instantaneous setting
-                
-            fc_relay = fc_base * (base_v_val / row_v_val)
-            t_idmt = calc_time(fc_relay, pu_val, tms_val, c_const)
-            
-            if not np.isnan(t_idmt):
-                x_vals.append(fc_base)
-                y_vals.append(t_idmt)
-
-        # Plot Instantaneous Drop Visually
-        if inst_val_base and inst_val_base in base_plot_currents:
-            t_idmt_at_inst = calc_time(inst_val_base * (base_v_val / row_v_val), pu_val, tms_val, c_const)
-            x_vals.append(inst_val_base)
-            y_vals.append(t_idmt_at_inst) 
-            x_vals.append(inst_val_base)
-            y_vals.append(0.03) # Approximate 30ms Instantaneous breaker time
-            x_vals.append(max(base_plot_currents))
-            y_vals.append(0.03)
-
-        fig.add_trace(go.Scatter(
-            x=x_vals, 
-            y=y_vals, 
-            mode='lines', 
-            name=f'{row["Substation"]} - {row["Feeder"]} ({row["Voltage"]})',
-            hovertemplate="Fault: %{x:.0f} A<br>Time: %{y:.3f} s<extra></extra>"
-        ))
-
-    limit_key = 'hs_limit_oc' if fault_type_key == "OC" else 'hs_limit_ef'
-    if limit_key in st.session_state:
-        hs_limit_base = st.session_state[limit_key] * (st.session_state['hs_down_v'] / base_v_val)
-        
-        fig.add_vline(
-            x=hs_limit_base, 
-            line_dash="dash", 
-            line_color="red", 
-            annotation_text=f" Rec. {fault_type_key} High-Set Limit", 
-            annotation_position="top right",
-            annotation_font_color="red"
-        )
-
-    fig.update_layout(
-        template=plot_template,
-        xaxis_title=f"Fault Current (Amps) - Referred to {plot_base_str} Base",
-        yaxis_title="Operating Time (Seconds)",
-        yaxis_type="log",
-        xaxis_type="log",
-        hovermode="x unified",
-        height=700,
-        legend=dict(yanchor="top", y=0.99, xanchor="right", x=0.99, bgcolor="rgba(0,0,0,0.5)")
+with col3:
+    st.subheader("Zone 3: 33kV PTR HV Primary")
+    st.caption("Remote/HV Backup (Delta Winding)")
+    hv_ct = st.number_input("PTR HV CT Primary (A at 33kV)", value=200.0, step=50.0)
+    hv_curve_name = st.selectbox("PTR HV IDMT Curve", list(CURVE_CONSTANTS.keys()), index=0, key="hv_c")
+    hv_oc_pickup_33kv = st.number_input("PTR HV 51 OC Pickup (A at 33kV)", value=125.0, step=5.0)
+    hv_oc_tms = st.number_input("PTR HV 51 OC TMS", value=0.22, step=0.01, format="%.2f")
+    st.markdown(
+        "ℹ️ **Dyn11 Vector Group Note:** An 11kV Single-Line-to-Ground fault circulates inside the 33kV Delta winding. "
+        "**Zero-sequence current cannot exit to the 33kV bus**, so the 33kV `51N` relay sees `0 A`. "
+        "Instead, the 33kV Phase `51` relay sees $I_{LV,EF} / (\\sqrt{3} \\times N)$."
     )
-    
-    st.plotly_chart(fig, use_container_width=True)
+
+# ---------------------------------------------------------
+# 3. RUN CALCULATIONS & HIGH-SET BISECTION
+# ---------------------------------------------------------
+ptr_data = calculate_ptr_parameters(33.0, 11.0, ptr_mva, ptr_z_pct, ngr_ohms, lv_ct, hv_ct)
+
+c_fdr = CURVE_CONSTANTS[fdr_curve_name]
+c_lv = CURVE_CONSTANTS[lv_curve_name]
+c_hv = CURVE_CONSTANTS[hv_curve_name]
+
+# Refer 33kV HV Phase OC Pickup to 11kV Equivalent Base:
+# 1) For 3-Phase Balanced Faults: I_11kV_eq = I_33kV_pickup * Turn_Ratio (3.0)
+hv_oc_pickup_referred_11kv_3ph = hv_oc_pickup_33kv * ptr_data["turn_ratio"]
+
+# 2) For 11kV Single-Line-to-Ground Faults across Dyn11 Delta-Star:
+# Only 1/sqrt(3) of per-unit fault current appears on one HV phase conductor: I_11kV_eq_LG = I_33kV_pickup * Turn_Ratio * sqrt(3)
+hv_oc_pickup_referred_11kv_lg = hv_oc_pickup_33kv * ptr_data["turn_ratio"] * math.sqrt(3)
+
+# High-Set Bisection Thresholds (11kV Base)
+hs_50_fdr_vs_lv = calculate_high_set_bisection(
+    lv_oc_pickup, lv_oc_tms, c_lv,
+    fdr_oc_pickup, fdr_oc_tms, c_fdr,
+    cti_sec=total_cti_sec, max_ceiling=ptr_data["max_3ph_sc_lv_A"]
+)
+
+hs_50_lv_vs_hv = calculate_high_set_bisection(
+    hv_oc_pickup_referred_11kv_3ph, hv_oc_tms, c_hv,
+    lv_oc_pickup, lv_oc_tms, c_lv,
+    cti_sec=total_cti_sec, max_ceiling=ptr_data["max_3ph_sc_lv_A"]
+)
+
+hs_50n_fdr_vs_lv = calculate_high_set_bisection(
+    lv_ef_pickup, lv_ef_tms, c_lv,
+    fdr_ef_pickup, fdr_ef_tms, c_fdr,
+    cti_sec=total_cti_sec, max_ceiling=ptr_data["max_ef_lv_A"]
+)
+
+# ---------------------------------------------------------
+# 4. KPI METRICS SUMMARY
+# ---------------------------------------------------------
+st.divider()
+m1, m2, m3, m4, m5 = st.columns(5)
+m1.metric("PTR Full Load (11kV / 33kV)", f"{ptr_data['i_fl_lv_A']} A / {ptr_data['i_fl_hv_A']} A")
+m2.metric("Max 3Ph Fault (%Z Ceiling)", f"{ptr_data['max_3ph_sc_lv_A']} A (11kV)", f"{ptr_data['max_3ph_sc_hv_A']} A at 33kV")
+m3.metric("Max NGR Restricted EF (11kV)", f"{ptr_data['max_ef_lv_A']} A", f"33kV Line Sees: {ptr_data['max_ef_reflected_hv_A']} A")
+m4.metric("Rec. 51G Pickup (20% NGR)", f"{ptr_data['rec_51g_pickup_A']} A", f"Plug: {ptr_data['rec_51g_plug_pct']}% of CT")
+m5.metric(
+    "ANSI 50 / 50N High-Set Limits",
+    f"50: {hs_50_fdr_vs_lv if hs_50_fdr_vs_lv else 'Selective'} A",
+    f"50N: {hs_50n_fdr_vs_lv if hs_50n_fdr_vs_lv else 'Selective'} A"
+)
+
+# ---------------------------------------------------------
+# 5. INTERACTIVE PLOTLY TCC CHARTS (REFERRED TO 11kV BASE)
+# ---------------------------------------------------------
+fig = make_subplots(
+    rows=1, cols=2,
+    subplot_titles=(
+        "Phase Overcurrent (ANSI 50/51) - 3 Zones (11kV Base)",
+        "Earth Fault (51N / 51G / Dyn11 33kV Reflected) - NGR Bounded"
+    )
+)
+
+max_3ph = int(ptr_data["max_3ph_sc_lv_A"])
+max_ef = int(ptr_data["max_ef_lv_A"])
+
+# --- Plot 1: 3-Zone Phase Overcurrent (51) ---
+fc_oc_range = list(range(20, max_3ph + 25, 25))
+fdr_oc_x, fdr_oc_y, lv_oc_x, lv_oc_y, hv_oc_x, hv_oc_y = [], [], [], [], [], []
+
+for fc in fc_oc_range:
+    t_f = calc_idmt_time(fc, fdr_oc_pickup, fdr_oc_tms, c_fdr)
+    t_l = calc_idmt_time(fc, lv_oc_pickup, lv_oc_tms, c_lv)
+    t_h = calc_idmt_time(fc, hv_oc_pickup_referred_11kv_3ph, hv_oc_tms, c_hv)
+    if t_f: fdr_oc_x.append(fc); fdr_oc_y.append(t_f)
+    if t_l: lv_oc_x.append(fc); lv_oc_y.append(t_l)
+    if t_h: hv_oc_x.append(fc); hv_oc_y.append(t_h)
+
+fig.add_trace(go.Scatter(x=fdr_oc_x, y=fdr_oc_y, name="Zone 1: 11kV Feeder 51", line=dict(color="#d32f2f", width=2.5)), row=1, col=1)
+fig.add_trace(go.Scatter(x=lv_oc_x, y=lv_oc_y, name="Zone 2: 11kV PTR LV 51", line=dict(color="#0288d1", width=2.5)), row=1, col=1)
+fig.add_trace(go.Scatter(x=hv_oc_x, y=hv_oc_y, name="Zone 3: 33kV PTR HV 51 (Ref 11kV)", line=dict(color="#388e3c", width=2.5, dash="dash")), row=1, col=1)
+
+fig.add_vline(x=max_3ph, line_dash="solid", line_color="black", annotation_text=f"PTR %Z Max 3Ph: {max_3ph}A", row=1, col=1)
+if hs_50_fdr_vs_lv:
+    fig.add_vline(x=hs_50_fdr_vs_lv, line_dash="dot", line_color="orange", annotation_text=f"Feeder 50 High-Set: {hs_50_fdr_vs_lv}A", row=1, col=1)
+
+# --- Plot 2: Earth Fault (51N / 51G + Dyn11 33kV Phase 51 Sensitivity) ---
+step_ef = max(2, int(max_ef / 120))
+fc_ef_range = list(range(5, max_ef + step_ef, step_ef))
+fdr_ef_x, fdr_ef_y, lv_ef_x, lv_ef_y, hv_lg_x, hv_lg_y = [], [], [], [], [], []
+
+for fc in fc_ef_range:
+    t_f_ef = calc_idmt_time(fc, fdr_ef_pickup, fdr_ef_tms, c_fdr)
+    t_l_ef = calc_idmt_time(fc, lv_ef_pickup, lv_ef_tms, c_lv)
+    # 33kV Phase 51 response to an 11kV L-G fault (compensated for Dyn11 sqrt(3) factor)
+    t_h_lg = calc_idmt_time(fc, hv_oc_pickup_referred_11kv_lg, hv_oc_tms, c_hv)
+    if t_f_ef: fdr_ef_x.append(fc); fdr_ef_y.append(t_f_ef)
+    if t_l_ef: lv_ef_x.append(fc); lv_ef_y.append(t_l_ef)
+    if t_h_lg: hv_lg_x.append(fc); hv_lg_y.append(t_h_lg)
+
+fig.add_trace(go.Scatter(x=fdr_ef_x, y=fdr_ef_y, name="Zone 1: 11kV Feeder 51N", line=dict(color="#d32f2f", width=2.5, dash="dot")), row=1, col=2)
+fig.add_trace(go.Scatter(x=lv_ef_x, y=lv_ef_y, name="Zone 2: PTR Neutral 51G", line=dict(color="#0288d1", width=2.5, dash="dot")), row=1, col=2)
+fig.add_trace(go.Scatter(x=hv_lg_x, y=hv_lg_y, name="Zone 3: 33kV 51 (Dyn11 L-G Reflected)", line=dict(color="#388e3c", width=2, dash="dashdot")), row=1, col=2)
+
+fig.add_vline(x=max_ef, line_dash="solid", line_color="purple", annotation_text=f"NGR Max EF: {max_ef}A", row=1, col=2)
+if hs_50n_fdr_vs_lv:
+    fig.add_vline(x=hs_50n_fdr_vs_lv, line_dash="dot", line_color="orange", annotation_text=f"50N High-Set: {hs_50n_fdr_vs_lv}A", row=1, col=2)
+
+fig.update_xaxes(type="log", title_text="Fault Current Referred to 11kV Base (A)")
+fig.update_yaxes(type="log", title_text="Operating Time (s)", range=[-1.5, 2.0])
+fig.update_layout(height=580, legend=dict(orientation="h", yanchor="bottom", y=-0.25, xanchor="center", x=0.5))
+
+st.plotly_chart(fig, use_container_width=True)
+
+# ---------------------------------------------------------
+# 6. SELECTIVITY AUDIT TABLE ACROSS FAULT LEVELS
+# ---------------------------------------------------------
+st.subheader("📋 3-Zone Coordination & Selectivity Audit Table")
+
+test_points = sorted(list(set([
+    int(ptr_data["i_fl_lv_A"] * 1.5),
+    int(ptr_data["max_ef_lv_A"]),
+    int(ptr_data["max_3ph_sc_lv_A"] * 0.5),
+    int(ptr_data["max_3ph_sc_lv_A"])
+])))
+
+audit_rows = []
+for fc in test_points:
+    t1_oc = calc_idmt_time(fc, fdr_oc_pickup, fdr_oc_tms, c_fdr)
+    t2_oc = calc_idmt_time(fc, lv_oc_pickup, lv_oc_tms, c_lv)
+    t3_oc = calc_idmt_time(fc, hv_oc_pickup_referred_11kv_3ph, hv_oc_tms, c_hv)
+
+    cti_12_ms = (t2_oc - t1_oc) * 1000.0 if (t1_oc and t2_oc) else None
+    cti_23_ms = (t3_oc - t2_oc) * 1000.0 if (t2_oc and t3_oc) else None
+
+    status = "✅ PASS (Selective)"
+    if (cti_12_ms is not None and cti_12_ms < total_cti_sec * 1000.0) or (cti_23_ms is not None and cti_23_ms < total_cti_sec * 1000.0):
+        status = "⚠️ Enable ANSI 50 High-Set"
+
+    audit_rows.append({
+        "11kV Fault Current (A)": fc,
+        "Reflected 33kV 3Ph Current (A)": round(fc / ptr_data["turn_ratio"], 1),
+        "Reflected 33kV Dyn11 L-G Current (A)": round(fc * ptr_data["dyn11_lg_hv_factor"], 1),
+        "Zone 1 Feeder 51 (s)": round(t1_oc, 3) if t1_oc else "No Pickup",
+        "Zone 2 PTR LV 51 (s)": round(t2_oc, 3) if t2_oc else "No Pickup",
+        "Zone 3 PTR HV 51 (s)": round(t3_oc, 3) if t3_oc else "No Pickup",
+        "Margin Z2-Z1 (ms)": round(cti_12_ms, 1) if cti_12_ms else "N/A",
+        "Margin Z3-Z2 (ms)": round(cti_23_ms, 1) if cti_23_ms else "N/A",
+        "Audit Verdict": status
+    })
+
+df_audit = pd.DataFrame(audit_rows)
+st.dataframe(df_audit, use_container_width=True)
+
+csv_bytes = df_audit.to_csv(index=False).encode("utf-8")
+st.download_button(
+    label=f"📥 Download {substation_name} Coordination Audit CSV",
+    data=csv_bytes,
+    file_name=f"{substation_name}_3Zone_Relay_Audit.csv",
+    mime="text/csv"
+)
