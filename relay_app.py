@@ -12,7 +12,6 @@ CURVE_CONSTANTS = {
     "1.3 Sec curve (Fast Inverse)": 0.0607,
 }
 
-# Standard 11kV Overhead Conductors & Underground XLPE Cable (Positive Sequence Ohms/km at 50Hz)
 CONDUCTOR_PRESETS = {
     "ACSR Dog (100 sq.mm)": {"R1": 0.273, "X1": 0.335},
     "ACSR Raccoon (80 sq.mm)": {"R1": 0.366, "X1": 0.345},
@@ -20,6 +19,15 @@ CONDUCTOR_PRESETS = {
     "ACSR Weasel (30 sq.mm)": {"R1": 0.908, "X1": 0.380},
     "11kV XLPE Cable (3x300 sq.mm Al)": {"R1": 0.125, "X1": 0.088},
     "Custom R + jX": {"R1": 0.366, "X1": 0.345},
+}
+
+CT_CLASS_PRESETS = {
+    "5P10": 10.0,
+    "5P15": 15.0,
+    "5P20": 20.0,
+    "10P10": 10.0,
+    "10P15": 15.0,
+    "10P20": 20.0,
 }
 
 def calc_idmt_time(fault_current, pickup_current, tms, curve_constant):
@@ -58,8 +66,7 @@ def calculate_ptr_parameters(v_hv_kv, v_lv_kv, ptr_mva, ptr_z_pct, ngr_ohms, ct_
     i_sc_3ph_lv = i_fl_lv / z_pu
     i_sc_3ph_hv = i_fl_hv / z_pu
 
-    # PTR Source Impedance referred to 11kV side in Ohms (Z_ptr = (kV^2 / MVA) * z_pu)
-    # Using typical X/R = 10 for 8 MVA Power Transformer
+    # PTR Source Impedance referred to 11kV side in Ohms (X/R = 10 typical for 8 MVA PTR)
     z_ptr_ohms = ((v_lv_kv ** 2) / ptr_mva) * z_pu
     r_ptr_ohms = z_ptr_ohms / math.sqrt(1 + 10**2)
     x_ptr_ohms = r_ptr_ohms * 10.0
@@ -100,28 +107,21 @@ def calc_fault_at_distance_km(dist_km, v_ln_volts, r_ptr, x_ptr, r1_km, x1_km):
     return v_ln_volts / z_total if z_total > 0 else 0.0
 
 def calc_ansi_50_reach_km(hs_pickup_amps, v_ln_volts, r_ptr, x_ptr, r1_km, x1_km, total_length_km):
-    """
-    Solves quadratic impedance equation |(R_ptr + R1*L) + j(X_ptr + X1*L)| = V_LN / I_50
-    to find the exact distance L (km) where fault current drops below the ANSI 50 pickup.
-    """
+    """Finds exact distance L (km) where fault current drops below the ANSI 50 pickup."""
     if not hs_pickup_amps or hs_pickup_amps <= 0:
         return 0.0, 0.0
 
     z_target = v_ln_volts / hs_pickup_amps
     z_ptr = math.hypot(r_ptr, x_ptr)
-
-    # If pickup is set higher than bolted bus fault at 0 km, reach is 0 km
     if z_target <= z_ptr:
         return 0.0, 0.0
 
-    # Quadratic coefficients: a*L^2 + b*L + c = 0
     a = (r1_km ** 2) + (x1_km ** 2)
     b = 2.0 * ((r_ptr * r1_km) + (x_ptr * x1_km))
     c = (r_ptr ** 2) + (x_ptr ** 2) - (z_target ** 2)
 
     if a <= 0:
         return 0.0, 0.0
-
     discriminant = (b ** 2) - (4.0 * a * c)
     if discriminant < 0:
         return 0.0, 0.0
@@ -129,6 +129,64 @@ def calc_ansi_50_reach_km(hs_pickup_amps, v_ln_volts, r_ptr, x_ptr, r1_km, x1_km
     reach_km = (-b + math.sqrt(discriminant)) / (2.0 * a)
     reach_pct = (reach_km / total_length_km) * 100.0 if total_length_km > 0 else 0.0
     return round(max(0.0, reach_km), 2), round(max(0.0, reach_pct), 1)
+
+def evaluate_ct_saturation(
+    zone_name, ct_primary, ct_secondary, rated_va, ct_class_str,
+    r_ct_ohms, lead_length_m, lead_sqmm, relay_va, max_fault_primary_amps
+):
+    """
+    Calculates CT Rated vs. Effective Accuracy Limit Factor (ALF_eff), Knee-Point Voltage (V_k),
+    and checks whether the CT saturates at the maximum bolted primary fault current.
+    Copper resistivity rho = 0.0178 Ohm*mm^2/m (loop factor = 2 * length).
+    """
+    alf_rated = CT_CLASS_PRESETS.get(ct_class_str, 10.0)
+    i_sec_sq = ct_secondary ** 2  # 25 for 5A CT, 1 for 1A CT
+
+    # Rated Connected Burden Impedance: R_b_rated = Rated_VA / (I_sec^2)
+    r_b_rated = rated_va / i_sec_sq
+
+    # Actual Connected Burden Impedance: Lead Loop Resistance + Relay Input Impedance
+    r_lead_loop = (2.0 * lead_length_m * 0.0178) / lead_sqmm if lead_sqmm > 0 else 0.0
+    r_relay = relay_va / i_sec_sq
+    r_b_actual = r_lead_loop + r_relay
+
+    # Total Rated vs. Actual Loop Impedance (including CT secondary winding resistance R_ct)
+    z_total_rated = r_ct_ohms + r_b_rated
+    z_total_actual = r_ct_ohms + r_b_actual
+
+    # Equivalent Knee-Point EMF (V_k) and Required Fault Secondary EMF (V_req)
+    v_knee = alf_rated * ct_secondary * z_total_rated
+    alf_effective = alf_rated * (z_total_rated / z_total_actual) if z_total_actual > 0 else alf_rated
+
+    # Max Unsaturated Primary Current vs. Actual Max Fault Multiple
+    max_unsat_primary_amps = alf_effective * ct_primary
+    actual_fault_multiple = max_fault_primary_amps / ct_primary if ct_primary > 0 else 0.0
+    i_fault_sec = max_fault_primary_amps * (ct_secondary / ct_primary) if ct_primary > 0 else 0.0
+    v_fault_req = i_fault_sec * z_total_actual
+
+    safety_ratio = alf_effective / actual_fault_multiple if actual_fault_multiple > 0 else 99.0
+    if safety_ratio >= 1.2:
+        verdict = "✅ PASS (Linear / Unsaturated)"
+    elif safety_ratio >= 1.0:
+        verdict = "⚠️ MARGINAL (<20% Headroom)"
+    else:
+        verdict = "❌ SATURATES (Upgrade VA / Class)"
+
+    return {
+        "Zone": zone_name,
+        "CT Ratio & Class": f"{int(ct_primary)}/{int(ct_secondary)}A ({rated_va:.0f}VA {ct_class_str})",
+        "Rated Burden Z (Ω)": round(r_b_rated, 3),
+        "Actual Loop Z (Rct+Lead+Relay Ω)": round(z_total_actual, 3),
+        "Rated ALF": alf_rated,
+        "Effective ALF (ALF_eff)": round(alf_effective, 1),
+        "Max Unsat. Current (A)": round(max_unsat_primary_amps, 0),
+        "Max Zone Fault (A)": round(max_fault_primary_amps, 0),
+        "Actual Fault Multiple (x In)": round(actual_fault_multiple, 1),
+        "Knee EMF Vk / Req Vf (V)": f"{v_knee:.1f} V / {v_fault_req:.1f} V",
+        "CT Saturation Verdict": verdict,
+        "alf_eff_num": round(alf_effective, 2),
+        "fault_mult_num": round(actual_fault_multiple, 2)
+    }
 
 def calculate_high_set_bisection(
     up_pickup, up_tms, up_c,
@@ -166,14 +224,14 @@ def calculate_high_set_bisection(
 # ---------------------------------------------------------
 # 2. STREAMLIT WEB APP UI
 # ---------------------------------------------------------
-st.set_page_config(page_title="STM 3-Zone Relay & Distance Reach", layout="wide")
-st.title("⚡ 3-Zone Relay Coordination & 11kV Feeder Distance-Reach Web App")
+st.set_page_config(page_title="STM 3-Zone Relay, Distance & CT Saturation", layout="wide")
+st.title("⚡ 3-Zone Relay Coordination, 11kV Line Reach & CT Saturation Web App")
 st.markdown(
-    "Simulates **3-Zone Composite IDMT (51) + High-Set (50) Coordination** across a **33/11kV Dyn11 PTR** "
-    "and calculates the **exact kilometer reach ($L_{\\text{reach}}$)** of the **ANSI 50** element using **Line Impedance ($R_1 + jX_1$ / km)**."
+    "Full substation protection suite: **3-Zone Composite IDMT (51) + High-Set (50) Coordination**, "
+    "**11kV Feeder Distance-Reach ($L_{\\text{reach}}$)**, and **CT Saturation / Effective Accuracy Limit Factor ($ALF_{\\text{eff}}$) Verification**."
 )
 
-# Sidebar: PTR, Breaker & Feeder Line Impedance Specs
+# Sidebar: PTR, Breaker, Feeder Line Impedance & CT Burden Specs
 with st.sidebar:
     st.header("1. PTR & Substation Specs")
     substation_name = st.text_input("Substation Name", value="CHHINDWARA_33_11KV")
@@ -192,13 +250,19 @@ with st.sidebar:
     feeder_length_km = st.number_input("Total 11kV Feeder Length (km)", min_value=0.5, max_value=100.0, value=12.0, step=0.5)
     target_reach_pct = st.slider("Target ANSI 50 Protected Reach (%)", min_value=50, max_value=90, value=80, step=5)
 
-    st.header("3. Breaker (ANSI 52) Grading")
+    st.header("3. CT Secondary Loop & Burden")
+    ct_sec_rating = st.selectbox("CT Secondary Rating (A)", [5.0, 1.0], index=0)
+    lead_sqmm = st.selectbox("Control Cable Size (sq.mm Cu)", [2.5, 4.0, 6.0], index=0)
+    lead_length_m = st.number_input("One-Way CT-to-Relay Cable Length (m)", min_value=1.0, max_value=200.0, value=25.0, step=5.0)
+    r_ct_winding = st.number_input("CT Secondary Winding Rct (Ω)", min_value=0.05, max_value=5.0, value=0.25, step=0.05)
+    relay_burden_va = st.number_input("Numerical Relay Burden (VA)", min_value=0.05, max_value=10.0, value=0.50, step=0.10)
+
+    st.header("4. Breaker (ANSI 52) Grading")
     cb_open_ms = st.number_input("VCB (52) Interrupting Time (ms)", min_value=20.0, max_value=200.0, value=60.0, step=5.0)
     overshoot_ms = st.number_input("Relay Overshoot & Safety Margin (ms)", min_value=10.0, max_value=200.0, value=40.0, step=5.0)
     total_cti_sec = (cb_open_ms + overshoot_ms) / 1000.0
-    st.info(f"**Required Grading Margin (CTI):** `{total_cti_sec*1000:.0f} ms ({total_cti_sec:.2f} s)`")
 
-# Pre-calculate PTR and Feeder Distance Faults so we can show Recommended 80% Pickup in Zone 1 UI
+# Pre-calculate PTR and Feeder Distance Faults
 ptr_data = calculate_ptr_parameters(33.0, 11.0, ptr_mva, ptr_z_pct, ngr_ohms, 400.0, 200.0)
 target_reach_km = feeder_length_km * (target_reach_pct / 100.0)
 fault_at_target_reach = calc_fault_at_distance_km(
@@ -208,22 +272,23 @@ fault_at_feeder_end = calc_fault_at_distance_km(
     feeder_length_km, ptr_data["v_lv_ln_volts"], ptr_data["r_ptr_ohms"], ptr_data["x_ptr_ohms"], r1_per_km, x1_per_km
 )
 
-# Main Relay Settings Columns (3 Protection Zones)
+# Main Relay & CT Settings Columns (3 Protection Zones)
 col1, col2, col3 = st.columns(3)
 
 with col1:
     st.subheader("Zone 1: 11kV Outgoing Feeder")
     st.caption(f"Rec. {target_reach_pct}% Zone-1 50 Pickup: **{fault_at_target_reach:.0f} A** ({target_reach_km:.1f} km)")
     fdr_ct = st.number_input("Feeder CT Primary (A)", value=200.0, step=50.0)
+    c1_a, c1_b = st.columns(2)
+    fdr_ct_va = c1_a.selectbox("Feeder CT VA", [10.0, 15.0, 30.0], index=1)
+    fdr_ct_class = c1_b.selectbox("Feeder CT Class", list(CT_CLASS_PRESETS.keys()), index=0)
+
     fdr_curve_name = st.selectbox("Feeder IDMT Curve", list(CURVE_CONSTANTS.keys()), index=0, key="fdr_c")
-    
-    st.markdown("**ANSI 51 / 51N (IDMT Settings)**")
     fdr_oc_pickup = st.number_input("Feeder 51 OC Pickup (A)", value=150.0, step=10.0)
     fdr_oc_tms = st.number_input("Feeder 51 OC TMS", value=0.08, step=0.01, format="%.2f")
     fdr_ef_pickup = st.number_input("Feeder 51N EF Pickup (A)", value=20.0, step=5.0)
     fdr_ef_tms = st.number_input("Feeder 51N EF TMS", value=0.05, step=0.01, format="%.2f")
 
-    st.markdown("**ANSI 50 / 50N (High-Set Settings)**")
     fdr_50_en = st.checkbox("Enable Feeder ANSI 50 (Phase High-Set)", value=True)
     fdr_50_pickup = st.number_input("Feeder 50 High-Set Pickup (A)", value=float(round(fault_at_target_reach, -1)), step=50.0, disabled=not fdr_50_en)
     fdr_50_delay = st.number_input("Feeder 50 Operating Time (s)", min_value=0.02, max_value=2.0, value=0.05, step=0.01, format="%.2f", disabled=not fdr_50_en)
@@ -236,15 +301,16 @@ with col2:
     st.subheader("Zone 2: 11kV PTR LV Incomer")
     st.caption("Local Backup (Star Winding + NGR)")
     lv_ct = st.number_input("PTR LV CT Primary (A)", value=400.0, step=50.0)
+    c2_a, c2_b = st.columns(2)
+    lv_ct_va = c2_a.selectbox("PTR LV CT VA", [10.0, 15.0, 30.0], index=1)
+    lv_ct_class = c2_b.selectbox("PTR LV CT Class", list(CT_CLASS_PRESETS.keys()), index=2)
+
     lv_curve_name = st.selectbox("PTR LV IDMT Curve", list(CURVE_CONSTANTS.keys()), index=0, key="lv_c")
-    
-    st.markdown("**ANSI 51 / 51G (IDMT Settings)**")
     lv_oc_pickup = st.number_input("PTR LV 51 OC Pickup (A)", value=300.0, step=10.0)
     lv_oc_tms = st.number_input("PTR LV 51 OC TMS", value=0.15, step=0.01, format="%.2f")
     lv_ef_pickup = st.number_input("PTR Neutral 51G Pickup (A)", value=30.0, step=5.0)
     lv_ef_tms = st.number_input("PTR Neutral 51G TMS", value=0.12, step=0.01, format="%.2f")
 
-    st.markdown("**ANSI 50 / 50G (High-Set Settings)**")
     lv_50_en = st.checkbox("Enable PTR LV ANSI 50 (Phase High-Set)", value=False)
     lv_50_pickup = st.number_input("PTR LV 50 High-Set Pickup (A)", value=2800.0, step=100.0, disabled=not lv_50_en)
     lv_50_delay = st.number_input("PTR LV 50 Time Delay (s)", min_value=0.02, max_value=2.0, value=0.20, step=0.01, format="%.2f", disabled=not lv_50_en)
@@ -257,27 +323,41 @@ with col3:
     st.subheader("Zone 3: 33kV PTR HV Primary")
     st.caption("Remote/HV Backup (Delta Winding)")
     hv_ct = st.number_input("PTR HV CT Primary (A at 33kV)", value=200.0, step=50.0)
+    c3_a, c3_b = st.columns(2)
+    hv_ct_va = c3_a.selectbox("PTR HV CT VA", [10.0, 15.0, 30.0], index=1)
+    hv_ct_class = c3_b.selectbox("PTR HV CT Class", list(CT_CLASS_PRESETS.keys()), index=2)
+
     hv_curve_name = st.selectbox("PTR HV IDMT Curve", list(CURVE_CONSTANTS.keys()), index=0, key="hv_c")
-    
-    st.markdown("**ANSI 51 (IDMT Settings)**")
     hv_oc_pickup_33kv = st.number_input("PTR HV 51 OC Pickup (A at 33kV)", value=125.0, step=5.0)
     hv_oc_tms = st.number_input("PTR HV 51 OC TMS", value=0.22, step=0.01, format="%.2f")
 
-    st.markdown("**ANSI 50 (High-Set Settings at 33kV)**")
     hv_50_en = st.checkbox("Enable PTR HV ANSI 50 (33kV High-Set)", value=True)
     hv_50_pickup_33kv = st.number_input("PTR HV 50 High-Set Pickup (A at 33kV)", value=1850.0, step=50.0, disabled=not hv_50_en)
     hv_50_delay = st.number_input("PTR HV 50 Operating Time (s)", min_value=0.02, max_value=2.0, value=0.05, step=0.01, format="%.2f", disabled=not hv_50_en)
 
 # ---------------------------------------------------------
-# 3. RUN CALCULATIONS, REACH & HIGH-SET BISECTION
+# 3. RUN CALCULATIONS, REACH & CT SATURATION AUDIT
 # ---------------------------------------------------------
 ptr_data = calculate_ptr_parameters(33.0, 11.0, ptr_mva, ptr_z_pct, ngr_ohms, lv_ct, hv_ct)
 
-# Calculate Actual Reach of User's Feeder ANSI 50 Setting
 actual_reach_km, actual_reach_pct = calc_ansi_50_reach_km(
     fdr_50_pickup if fdr_50_en else 0.0,
     ptr_data["v_lv_ln_volts"], ptr_data["r_ptr_ohms"], ptr_data["x_ptr_ohms"],
     r1_per_km, x1_per_km, feeder_length_km
+)
+
+# Evaluate CT Saturation across all 3 Zones
+ct_eval_z1 = evaluate_ct_saturation(
+    "Zone 1: 11kV Feeder CT", fdr_ct, ct_sec_rating, fdr_ct_va, fdr_ct_class,
+    r_ct_winding, lead_length_m, lead_sqmm, relay_burden_va, ptr_data["max_3ph_sc_lv_A"]
+)
+ct_eval_z2 = evaluate_ct_saturation(
+    "Zone 2: 11kV PTR LV CT", lv_ct, ct_sec_rating, lv_ct_va, lv_ct_class,
+    r_ct_winding, lead_length_m, lead_sqmm, relay_burden_va, ptr_data["max_3ph_sc_lv_A"]
+)
+ct_eval_z3 = evaluate_ct_saturation(
+    "Zone 3: 33kV PTR HV CT", hv_ct, ct_sec_rating, hv_ct_va, hv_ct_class,
+    r_ct_winding, lead_length_m, lead_sqmm, relay_burden_va, ptr_data["max_3ph_sc_hv_A"]
 )
 
 c_fdr = CURVE_CONSTANTS[fdr_curve_name]
@@ -286,39 +366,30 @@ c_hv = CURVE_CONSTANTS[hv_curve_name]
 
 hv_oc_pickup_referred_11kv_3ph = hv_oc_pickup_33kv * ptr_data["turn_ratio"]
 hv_50_pickup_referred_11kv_3ph = hv_50_pickup_33kv * ptr_data["turn_ratio"]
-
 hv_oc_pickup_referred_11kv_lg = hv_oc_pickup_33kv * ptr_data["turn_ratio"] * math.sqrt(3)
 hv_50_pickup_referred_11kv_lg = hv_50_pickup_33kv * ptr_data["turn_ratio"] * math.sqrt(3)
-
-rec_50_fdr_vs_lv = calculate_high_set_bisection(
-    lv_oc_pickup, lv_oc_tms, c_lv,
-    fdr_oc_pickup, fdr_oc_tms, c_fdr,
-    cti_sec=total_cti_sec, max_ceiling=ptr_data["max_3ph_sc_lv_A"]
-)
-
-rec_50n_fdr_vs_lv = calculate_high_set_bisection(
-    lv_ef_pickup, lv_ef_tms, c_lv,
-    fdr_ef_pickup, fdr_ef_tms, c_fdr,
-    cti_sec=total_cti_sec, max_ceiling=ptr_data["max_ef_lv_A"]
-)
 
 # ---------------------------------------------------------
 # 4. KPI METRICS SUMMARY
 # ---------------------------------------------------------
 st.divider()
 m1, m2, m3, m4, m5 = st.columns(5)
-m1.metric("11kV Bus Fault (0 km)", f"{ptr_data['max_3ph_sc_lv_A']} A", f"PTR Z: {ptr_data['z_ptr_ohms']} Ω")
-m2.metric(f"Fault at {target_reach_pct}% Line ({target_reach_km:.1f} km)", f"{fault_at_target_reach:.0f} A", f"Rec. 50 Setting")
-m3.metric(f"Fault at 100% Line ({feeder_length_km:.1f} km)", f"{fault_at_feeder_end:.0f} A", f"Min 3Ph Fault")
-m4.metric(
+m1.metric("11kV Bus Fault (0 km)", f"{ptr_data['max_3ph_sc_lv_A']} A", f"33kV Through-Fault: {ptr_data['max_3ph_sc_hv_A']} A")
+m2.metric(f"Fault at {target_reach_pct}% Line ({target_reach_km:.1f} km)", f"{fault_at_target_reach:.0f} A", f"End ({feeder_length_km:.0f}km): {fault_at_feeder_end:.0f} A")
+m3.metric(
     "Actual ANSI 50 Line Reach",
     f"{actual_reach_km} km ({actual_reach_pct}%)" if fdr_50_en else "Disabled",
     "✅ Safe (<85%)" if actual_reach_pct <= 85 else "⚠️ Overreaching (>85%)"
 )
+m4.metric(
+    "Feeder CT Effective ALF",
+    f"{ct_eval_z1['Effective ALF (ALF_eff)']} x In ({ct_eval_z1['Max Unsat. Current (A)']:.0f} A)",
+    f"Fault Mult: {ct_eval_z1['Actual Fault Multiple (x In)']} x In"
+)
 m5.metric(
-    "Max NGR Restricted EF (11kV)",
-    f"{ptr_data['max_ef_lv_A']} A",
-    f"Rec 51G: {ptr_data['rec_51g_pickup_A']} A ({ptr_data['rec_51g_plug_pct']}%)"
+    "PTR LV CT Effective ALF",
+    f"{ct_eval_z2['Effective ALF (ALF_eff)']} x In ({ct_eval_z2['Max Unsat. Current (A)']:.0f} A)",
+    f"Fault Mult: {ct_eval_z2['Actual Fault Multiple (x In)']} x In"
 )
 
 # ---------------------------------------------------------
@@ -389,25 +460,33 @@ if fdr_50_en:
 
 fig.update_xaxes(type="log", title_text="Fault Current (A)", row=1, col=1)
 fig.update_yaxes(type="log", title_text="Operating Time (s)", range=[-1.6, 2.0], row=1, col=1)
-
 fig.update_xaxes(type="log", title_text="Fault Current (A)", row=1, col=2)
 fig.update_yaxes(type="log", title_text="Operating Time (s)", range=[-1.6, 2.0], row=1, col=2)
-
 fig.update_xaxes(title_text="Feeder Distance from Substation (km)", row=1, col=3)
 fig.update_yaxes(title_text="3-Phase Fault Current (A)", row=1, col=3)
+fig.update_layout(height=540, legend=dict(orientation="h", yanchor="bottom", y=-0.28, xanchor="center", x=0.5))
 
-fig.update_layout(height=550, legend=dict(orientation="h", yanchor="bottom", y=-0.28, xanchor="center", x=0.5))
 st.plotly_chart(fig, use_container_width=True)
 
 # ---------------------------------------------------------
-# 6. DISTANCE-BASED & COMPOSITE SELECTIVITY AUDIT TABLE
+# 6. CT SATURATION & EFFECTIVE ALF VERIFICATION TABLE
+# ---------------------------------------------------------
+st.subheader("🧲 3-Zone CT Saturation & Effective Accuracy Limit Factor (ALF_eff) Verification")
+df_ct = pd.DataFrame([
+    {k: v for k, v in ct_eval_z1.items() if not k.endswith("_num")},
+    {k: v for k, v in ct_eval_z2.items() if not k.endswith("_num")},
+    {k: v for k, v in ct_eval_z3.items() if not k.endswith("_num")},
+])
+st.dataframe(df_ct, use_container_width=True)
+
+# ---------------------------------------------------------
+# 7. DISTANCE-BASED & COMPOSITE SELECTIVITY AUDIT TABLE
 # ---------------------------------------------------------
 st.subheader("📋 Feeder Distance & 3-Zone Composite (ANSI 51 + 50) Selectivity Audit Table")
 
-distance_checkpoints_pct = [0, 25, 50, target_reach_pct, 85, 100]
-distance_checkpoints_pct = sorted(list(set(distance_checkpoints_pct)))
-
+distance_checkpoints_pct = sorted(list(set([0, 25, 50, target_reach_pct, 85, 100])))
 audit_rows = []
+
 for pct in distance_checkpoints_pct:
     d_km = round(feeder_length_km * (pct / 100.0), 2)
     fc = round(calc_fault_at_distance_km(
@@ -419,6 +498,7 @@ for pct in distance_checkpoints_pct:
     t3_oc = calc_composite_time(fc, hv_oc_pickup_referred_11kv_3ph, hv_oc_tms, c_hv, hv_50_en, hv_50_pickup_referred_11kv_3ph, hv_50_delay)
 
     z1_element = "50 (High-Set)" if (fdr_50_en and fc >= fdr_50_pickup) else ("51 (IDMT)" if t1_oc else "None")
+    fdr_ct_state = "Linear" if fc <= ct_eval_z1["Max Unsat. Current (A)"] else "⚠️ Saturated"
     cti_12_ms = (t2_oc - t1_oc) * 1000.0 if (t1_oc and t2_oc) else None
     cti_23_ms = (t3_oc - t2_oc) * 1000.0 if (t2_oc and t3_oc) else None
 
@@ -429,7 +509,7 @@ for pct in distance_checkpoints_pct:
     audit_rows.append({
         "Feeder Location": f"{pct}% ({d_km} km)",
         "11kV 3Ph Fault (A)": fc,
-        "Reflected 33kV 3Ph (A)": round(fc / ptr_data["turn_ratio"], 1),
+        "Feeder CT State": fdr_ct_state,
         "Active Z1 Element": z1_element,
         "Zone 1 Feeder Time (s)": round(t1_oc, 3) if t1_oc else "No Pickup",
         "Zone 2 PTR LV Time (s)": round(t2_oc, 3) if t2_oc else "No Pickup",
@@ -442,10 +522,18 @@ for pct in distance_checkpoints_pct:
 df_audit = pd.DataFrame(audit_rows)
 st.dataframe(df_audit, use_container_width=True)
 
-csv_bytes = df_audit.to_csv(index=False).encode("utf-8")
-st.download_button(
-    label=f"📥 Download {substation_name} Distance & Relay Coordination Audit CSV",
-    data=csv_bytes,
-    file_name=f"{substation_name}_Distance_Reach_Audit.csv",
-    mime="text/csv"
-)
+col_dl1, col_dl2 = st.columns(2)
+with col_dl1:
+    st.download_button(
+        label=f"📥 Download {substation_name} Distance & Coordination Audit CSV",
+        data=df_audit.to_csv(index=False).encode("utf-8"),
+        file_name=f"{substation_name}_Distance_Coordination_Audit.csv",
+        mime="text/csv"
+    )
+with col_dl2:
+    st.download_button(
+        label=f"📥 Download {substation_name} CT Saturation Audit CSV",
+        data=df_ct.to_csv(index=False).encode("utf-8"),
+        file_name=f"{substation_name}_CT_Saturation_Audit.csv",
+        mime="text/csv"
+    )
