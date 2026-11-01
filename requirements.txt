@@ -9,4 +9,5 @@ pytz
 requests
 plotly
 pandas
+openpyxl
 
