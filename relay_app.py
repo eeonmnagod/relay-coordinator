@@ -20,6 +20,7 @@ TARGET_OUTPUT_SHEET_URL = (
     "https://docs.google.com/spreadsheets/d/1gd11j6eF6Qx4pB2Ckdf9iF7DoeBCD15Cl179Z0VnIxs/edit?usp=sharing"
 )
 
+# Updated GAS Web App Link
 DEFAULT_GAS_WEBHOOK_URL = (
     "https://script.google.com/macros/s/AKfycbwyWsu97iR--0gOaTwrpELAtNW-6ZHK6Qf0CNFFlRWdsW0Ltn3FFf6Ac-f6CmbkFyN5/exec"
 )
@@ -62,7 +63,7 @@ def push_relay_schedule_to_division_tab(gas_url, payload):
             gas_url.strip(),
             json=payload,
             headers={"Content-Type": "application/json"},
-            timeout=15
+            timeout=20
         )
         if resp.status_code == 200:
             return resp.json()
@@ -77,6 +78,7 @@ def extract_sheet_id(sheet_url_or_id):
 
 
 def parse_ptr_mva_value(raw_val):
+    """Extracts numerical MVA rating from strings like '5 MVA', '3.15', '1x5', '5 to 10'."""
     if pd.isna(raw_val):
         return 5.0
     s = str(raw_val).upper().strip()
@@ -107,15 +109,23 @@ def recommend_standard_ct(load_or_fl_amps):
 
 
 def parse_circle_tab_row2(df_raw, tab_name="UNKNOWN"):
-    """Tracks headers in Row 2 (index 1) of each Circle tab and forward-fills parent hierarchy cells."""
-    if df_raw is None or len(df_raw) < 2:
+    """
+    Accurately maps Row 2 (index 1) headers in each Circle tab by combining Row 2 text
+    with data-content heuristics so Circle, Division, 33kV Feeder, 33/11kV Substation,
+    PTR Capacity (MVA), and 11kV Feeder Code never shift into the wrong column.
+    """
+    if df_raw is None or len(df_raw) < 3:
         return pd.DataFrame()
 
+    circle_clean = tab_name.strip().upper()
+
+    # 1. Detect the exact header row (checking Row 2 = index 1 first, then index 0, 2, 3)
     header_idx = 1
     for candidate_idx in [1, 0, 2, 3]:
         if candidate_idx < len(df_raw):
-            row_str = " ".join(str(x).lower() for x in df_raw.iloc[candidate_idx].values if pd.notna(x))
-            if any(k in row_str for k in ["division", "substation", "s/s", "ptr", "capacity", "feeder", "code", "mva"]):
+            row_vals = [str(x).strip().lower() for x in df_raw.iloc[candidate_idx].values if pd.notna(x)]
+            row_str = " ".join(row_vals)
+            if sum(1 for k in ["division", "substation", "s/s", "feeder", "ptr", "mva", "capacity", "code"] if k in row_str) >= 2:
                 header_idx = candidate_idx
                 break
 
@@ -123,8 +133,12 @@ def parse_circle_tab_row2(df_raw, tab_name="UNKNOWN"):
     for col_i in range(df_raw.shape[1]):
         h_main = str(df_raw.iloc[header_idx, col_i]).strip() if pd.notna(df_raw.iloc[header_idx, col_i]) else ""
         h_prev = str(df_raw.iloc[header_idx - 1, col_i]).strip() if (header_idx > 0 and pd.notna(df_raw.iloc[header_idx - 1, col_i])) else ""
-        combined = f"{h_prev} {h_main}".strip() if (h_prev and h_prev.lower() != h_main.lower()) else (h_main or h_prev or f"col_{col_i}")
-        raw_cols.append(combined)
+        if h_main.lower() in ("nan", "none"):
+            h_main = ""
+        if h_prev.lower() in ("nan", "none"):
+            h_prev = ""
+        col_label = h_main if h_main else (h_prev if h_prev else f"col_{col_i}")
+        raw_cols.append(col_label)
 
     df = df_raw.iloc[header_idx + 1:].copy()
     seen = {}
@@ -135,46 +149,135 @@ def parse_circle_tab_row2(df_raw, tab_name="UNKNOWN"):
     df.columns = clean_cols
     df = df.dropna(how="all")
 
-    def find_col(keywords, exclude=None):
-        exclude = exclude or []
+    if df.empty:
+        return pd.DataFrame()
+
+    def sample_vals(col_name, n=25):
+        return [str(x).strip() for x in df[col_name].dropna().head(n).tolist() if str(x).strip().lower() not in ("nan", "none", "")]
+
+    def is_circle_column(col_name):
+        vals = sample_vals(col_name)
+        if not vals:
+            return False
+        matches = sum(1 for v in vals if v.upper() == circle_clean or circle_clean in v.upper())
+        return (matches / len(vals)) > 0.65
+
+    def is_valid_ptr_column(col_name):
+        vals = sample_vals(col_name)
+        if not vals:
+            return False
+        mva_hits = 0
+        for v in vals:
+            vu = v.upper()
+            if any(bad in vu for bad in ["VCB", "WORKING", "DEFECTIVE", "BYPASS", "MAKE", "REMARK"]):
+                return False
+            if re.search(r"\b(1\.6|2\.5|3\.15|4\.0|5|5\.0|6\.3|8|8\.0|10|10\.0|12\.5)\b", vu):
+                mva_hits += 1
+        return (mva_hits / len(vals)) >= 0.35
+
+    used_cols = set()
+
+    def pick_col(header_patterns, exclude_patterns=None, validator_fn=None):
+        exclude_patterns = exclude_patterns or []
         for col in df.columns:
+            if col in used_cols:
+                continue
             cl = col.lower()
-            if any(k in cl for k in keywords) and not any(ex in cl for ex in exclude):
-                return col
+            if any(ex in cl for ex in exclude_patterns):
+                continue
+            if any(re.search(pat, cl) for pat in header_patterns):
+                if validator_fn is None or validator_fn(col):
+                    used_cols.add(col)
+                    return col
         return None
 
-    col_div = find_col(["division", "div", "dn.", "o&m", "city"])
-    col_33fdr = find_col(["33kv feeder", "33 kv feeder", "33kv fdr", "33 kv fdr", "33kv name"], exclude=["code"])
-    col_33code = find_col(["33kv code", "33 kv code", "33kv feeder code", "33 kv feeder code", "33kv fdr code"])
-    col_ss = find_col(["33/11", "substation", "sub-station", "s/s name", "s/s"], exclude=["code", "132"])
-    col_sscode = find_col(["ss code", "s/s code", "substation code"])
-    col_ptr = find_col(["ptr", "capacity", "mva", "transformer"])
-    col_11fdr = find_col(["11kv feeder", "11 kv feeder", "11kv fdr", "11 kv fdr", "feeder name", "outgoing"], exclude=["33", "code"])
-    col_11code = find_col(["11kv code", "11 kv code", "11kv feeder code", "11 kv feeder code", "feeder code", "fdr code"], exclude=["33"])
-    col_load = find_col(["peak", "load", "amp", "max current", "current"])
+    # 1. Identify Circle Column (to exclude it from Division / Substation)
+    col_circle = pick_col([r"\bcircle\b", r"\bdistrict\b"], validator_fn=is_circle_column)
+    if not col_circle:
+        for col in df.columns:
+            if is_circle_column(col):
+                col_circle = col
+                used_cols.add(col)
+                break
 
+    # 2. Identify Division Column
+    col_div = pick_col(
+        [r"\bdivision\b", r"\bdiv\b", r"\bdn\b", r"name of div"],
+        exclude_patterns=["sub", "code", "circle"],
+        validator_fn=lambda c: not is_circle_column(c)
+    )
+
+    # 3. Identify 33kV Source Feeder Name & Code
+    col_33code = pick_col([r"33\s*kv.*code", r"33kv.*code", r"feeder code.*33"])
+    col_33fdr = pick_col(
+        [r"33\s*kv.*feeder", r"33kv.*feeder", r"33\s*kv.*fdr", r"33kv.*fdr", r"name of 33"],
+        exclude_patterns=["code", "11", "s/s", "substation"]
+    )
+
+    # 4. Identify 33/11kV Substation Code & Name
+    col_sscode = pick_col(
+        [r"s/s.*code", r"ss.*code", r"substation.*code", r"sub-station.*code", r"33/11.*code"],
+        exclude_patterns=["11kv", "11 kv", "33kv", "33 kv", "feeder"]
+    )
+    col_ss = pick_col(
+        [r"33/11\s*kv.*s/s", r"33/11.*substation", r"name of.*s/s", r"name of.*substation", r"\bsubstation\b", r"\bs/s\b"],
+        exclude_patterns=["code", "132", "33kv feeder", "11kv", "11 kv", "ptr", "capacity", "vcb"],
+        validator_fn=lambda c: not is_circle_column(c)
+    )
+
+    # 5. Identify PTR Capacity (MVA) Column
+    col_ptr = pick_col(
+        [r"ptr.*cap", r"capacity", r"\bmva\b", r"ptr.*mva", r"transformer.*cap", r"\bptr\b"],
+        exclude_patterns=["vcb", "status", "remark", "make", "code", "loading", "amp"],
+        validator_fn=is_valid_ptr_column
+    )
+    if not col_ptr:
+        for col in df.columns:
+            if col not in used_cols and is_valid_ptr_column(col):
+                col_ptr = col
+                used_cols.add(col)
+                break
+
+    # 6. Identify 11kV Outgoing Feeder Code & Name
+    col_11code = pick_col(
+        [r"11\s*kv.*code", r"11kv.*code", r"feeder.*code", r"fdr.*code", r"\bcode\b"],
+        exclude_patterns=["33", "s/s", "ss", "substation", "div"]
+    )
+    col_11fdr = pick_col(
+        [r"11\s*kv.*feeder", r"11kv.*feeder", r"11\s*kv.*fdr", r"11kv.*fdr", r"outgoing.*feeder", r"feeder.*name", r"\bfeeder\b"],
+        exclude_patterns=["33", "code", "s/s", "substation", "ptr", "vcb"]
+    )
+
+    # 7. Identify Peak Load (Amps) Column
+    col_load = pick_col(
+        [r"peak.*load", r"max.*load", r"load.*amp", r"current", r"\bamp\b", r"peak"],
+        exclude_patterns=["vcb", "status", "remark", "code", "name", "mva"]
+    )
+
+    # Forward-fill hierarchical parent columns across merged rows
     for parent_col in [col_div, col_33fdr, col_33code, col_ss, col_sscode, col_ptr]:
         if parent_col and parent_col in df.columns:
             df[parent_col] = df[parent_col].ffill()
 
-    circle_clean = tab_name.strip().upper()
     records = []
-
     for idx, r in df.iterrows():
         ss_val = str(r[col_ss]).strip() if col_ss and pd.notna(r[col_ss]) else ""
         if not ss_val or ss_val.lower() in ("nan", "none", "total", "grand total", "s.no", "sr.no"):
             continue
-        if any(hdr_w in ss_val.lower() for hdr_w in ["name of", "substation name", "33/11 kv s/s"]):
+        if any(w in ss_val.lower() for w in ["name of", "substation", "33/11 kv", "s/s name"]):
             continue
 
         div_val = str(r[col_div]).strip().upper() if col_div and pd.notna(r[col_div]) else f"{circle_clean} DIVISION"
+        if div_val.lower() in ("nan", "none", ""):
+            div_val = f"{circle_clean} DIVISION"
+
         f33_val = str(r[col_33fdr]).strip() if col_33fdr and pd.notna(r[col_33fdr]) else f"33kV {ss_val} Feeder"
         f33_code = str(r[col_33code]).strip().split(".")[0] if col_33code and pd.notna(r[col_33code]) else f"33F-{ss_val[:4].upper()}"
         sscode_val = str(r[col_sscode]).strip().split(".")[0] if col_sscode and pd.notna(r[col_sscode]) else f"SS-{idx}"
 
         ptr_raw = str(r[col_ptr]).strip() if col_ptr and pd.notna(r[col_ptr]) else "5.0 MVA"
         ptr_mva = parse_ptr_mva_value(ptr_raw)
-        ptr_label = f"{ptr_mva:g} MVA ({ptr_raw})" if ptr_raw and str(ptr_mva) not in ptr_raw else f"{ptr_mva:g} MVA"
+        ptr_label = f"{ptr_mva:g} MVA ({ptr_raw})" if (ptr_raw and str(ptr_mva) not in ptr_raw and "vcb" not in ptr_raw.lower()) else f"{ptr_mva:g} MVA"
 
         f11_val = str(r[col_11fdr]).strip() if col_11fdr and pd.notna(r[col_11fdr]) else ""
         f11_code = str(r[col_11code]).strip().split(".")[0] if col_11code and pd.notna(r[col_11code]) else ""
@@ -188,7 +291,9 @@ def parse_circle_tab_row2(df_raw, tab_name="UNKNOWN"):
         if col_load and pd.notna(r[col_load]):
             m_ld = re.findall(r"\d+(?:\.\d+)?", str(r[col_load]))
             if m_ld:
-                load_amps = float(m_ld[0])
+                val_f = float(m_ld[0])
+                if 1.0 <= val_f <= 1500.0:
+                    load_amps = val_f
 
         records.append({
             "circle": circle_clean,
@@ -599,7 +704,7 @@ with st.sidebar:
     gas_webhook_url = st.text_input(
         "Apps Script Web App URL (for Target Sheet)",
         value=DEFAULT_GAS_WEBHOOK_URL,
-        help="Deploy the Apps Script inside your Target Output Google Sheet and paste the /exec URL here."
+        help="Configured with your latest deployed Google Apps Script Web App URL."
     )
 
     st.divider()
@@ -649,6 +754,18 @@ with dd5:
         for _, row in df_ptr.iterrows()
     ]
     selected_feeder_option = st.selectbox("5️⃣ Associated 11kV Feeder Code", feeder_code_options, index=0)
+
+with st.expander("🛠️ Verify / Reload Circle Sheet Row-2 Hierarchy Mapping", expanded=False):
+    st.caption("Showing parsed hierarchy rows for the currently selected Circle and Division:")
+    st.dataframe(
+        df_div[
+            ["circle", "division", "feeder_33kv", "substation", "ss_code", "ptr_label", "feeder_11kv_code", "feeder_11kv", "peak_load_amps"]
+        ].head(25),
+        use_container_width=True
+    )
+    if st.button("🔄 Clear Cache & Reload Google Sheet Tabs"):
+        st.cache_data.clear()
+        st.rerun()
 
 selected_fdr_idx = feeder_code_options.index(selected_feeder_option)
 active_row = df_ptr.iloc[selected_fdr_idx]
@@ -763,7 +880,7 @@ if app_page.startswith("Page 1"):
         hv_50_delay = st.number_input("PTR HV 50 Operating Time (s)", min_value=0.02, max_value=2.0, value=0.05, step=0.01, format="%.2f", disabled=not hv_50_en)
 
     # 1-Click Save Button on Page 1 to Target Division Tab
-    if st.button(f"☁️ Save Feeder `{active_11kv_code}` & PTR Settings to `{active_division}` Tab in Target Google Sheet", use_container_width=True):
+    if st.button(f"☁️ Save Feeder `{active_11kv_code}` & PTR Settings to `{active_division}` Tab in Target Google Sheet", type="primary", use_container_width=True):
         p1_rows = [
             {
                 "Bay / Feeder Code": active_11kv_code,
