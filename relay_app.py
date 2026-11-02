@@ -226,12 +226,27 @@ def parse_circle_tab_row2(df_raw, tab_name="UNKNOWN"):
                 used_cols.add(col)
                 break
 
-    # 2. Identify Division Column
-    col_div = pick_col(
-        [r"\bName of (City/O&M) Division\b"],
-        exclude_patterns=["sub", "code", "circle", "lat", "long"],
-        validator_fn=lambda c: not is_circle_column(c)
-    )
+   # 2. Identify Division Column
+
+col_div = pick_col(
+    [
+        r"name\s*of.*city.*division",
+        r"name\s*of.*o.?m.*division",
+        r"city/o.?m.*division",
+        r"\bdivision\b"
+    ],
+    exclude_patterns=[
+        "circle",
+        "district",
+        "substation",
+        "s/s",
+        "feeder",
+        "code",
+        "lat",
+        "long"
+    ],
+    validator_fn=lambda c: not is_circle_column(c)
+)
 
     # 3. Identify 33kV Source Feeder Name & Code
     col_33code = pick_col(
