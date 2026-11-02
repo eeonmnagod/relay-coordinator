@@ -233,7 +233,8 @@ def parse_circle_tab_row2(df_raw, tab_name="UNKNOWN"):
         exclude_patterns=["circle","district","substation","s/s","feeder","code","lat", "long" ],
         validator_fn=lambda c: not is_circle_column(c)
     )
-
+    st.write("Detected Division Column:", col_div)
+    #print("Detected Division Column:", col_div)
     # 3. Identify 33kV Source Feeder Name & Code
     col_33code = pick_col(
         [r"33\s*kv.*feeder.*code", r"33\s*kv.*code", r"33kv.*code", r"feeder code.*33"],
