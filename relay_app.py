@@ -228,7 +228,7 @@ def parse_circle_tab_row2(df_raw, tab_name="UNKNOWN"):
 
     # 2. Identify Division Column
     col_div = pick_col(
-        [r"\bname of div", r"\bdivision\b", r"\bdiv\b", r"\bdn\b"],
+        [r"\bname of div", r"\bdivision\b", r"\bdiv\b", r"\bdn\b, r"\bName of (City/O&M) Division\b"],
         exclude_patterns=["sub", "code", "circle", "lat", "long"],
         validator_fn=lambda c: not is_circle_column(c)
     )
