@@ -111,8 +111,9 @@ def recommend_standard_ct(load_or_fl_amps):
 def parse_circle_tab_row2(df_raw, tab_name="UNKNOWN"):
     """
     Accurately maps Row 2 (index 1) headers in each Circle tab by combining Row 2 text
-    with data-content heuristics so Circle, Division, 33kV Feeder, 33/11kV Substation,
-    PTR Capacity (MVA), and 11kV Feeder Code never shift into the wrong column.
+    with data-content heuristics so Circle, Division, 33kV Feeder,
+    'Name of Associated 33/11KV S/s', PTR Capacity (MVA), and 11kV Feeder Code
+    never shift into Latitude/Longitude or adjacent columns.
     """
     if df_raw is None or len(df_raw) < 3:
         return pd.DataFrame()
@@ -153,7 +154,11 @@ def parse_circle_tab_row2(df_raw, tab_name="UNKNOWN"):
         return pd.DataFrame()
 
     def sample_vals(col_name, n=25):
-        return [str(x).strip() for x in df[col_name].dropna().head(n).tolist() if str(x).strip().lower() not in ("nan", "none", "")]
+        return [
+            str(x).strip()
+            for x in df[col_name].dropna().head(n).tolist()
+            if str(x).strip().lower() not in ("nan", "none", "")
+        ]
 
     def is_circle_column(col_name):
         vals = sample_vals(col_name)
@@ -161,6 +166,25 @@ def parse_circle_tab_row2(df_raw, tab_name="UNKNOWN"):
             return False
         matches = sum(1 for v in vals if v.upper() == circle_clean or circle_clean in v.upper())
         return (matches / len(vals)) > 0.65
+
+    def is_valid_substation_column(col_name):
+        """Rejects Circle columns and numeric/Latitude/Longitude coordinate columns."""
+        if is_circle_column(col_name):
+            return False
+        vals = sample_vals(col_name)
+        if not vals:
+            return False
+        alpha_count = 0
+        coord_or_num_count = 0
+        for v in vals:
+            # Check if value is purely numeric or a decimal lat/long coordinate
+            if re.match(r"^-?\d+(?:\.\d+)?$", v):
+                coord_or_num_count += 1
+            elif re.search(r"[A-Za-z]", v):
+                alpha_count += 1
+        if (coord_or_num_count / len(vals)) > 0.30:
+            return False
+        return (alpha_count / len(vals)) >= 0.50
 
     def is_valid_ptr_column(col_name):
         vals = sample_vals(col_name)
@@ -178,17 +202,19 @@ def parse_circle_tab_row2(df_raw, tab_name="UNKNOWN"):
     used_cols = set()
 
     def pick_col(header_patterns, exclude_patterns=None, validator_fn=None):
+        """Evaluates header_patterns in strict priority order so exact matches win first."""
         exclude_patterns = exclude_patterns or []
-        for col in df.columns:
-            if col in used_cols:
-                continue
-            cl = col.lower()
-            if any(ex in cl for ex in exclude_patterns):
-                continue
-            if any(re.search(pat, cl) for pat in header_patterns):
-                if validator_fn is None or validator_fn(col):
-                    used_cols.add(col)
-                    return col
+        for pat in header_patterns:
+            for col in df.columns:
+                if col in used_cols:
+                    continue
+                cl = re.sub(r"\s+", " ", col.lower()).strip()
+                if any(ex in cl for ex in exclude_patterns):
+                    continue
+                if re.search(pat, cl):
+                    if validator_fn is None or validator_fn(col):
+                        used_cols.add(col)
+                        return col
         return None
 
     # 1. Identify Circle Column (to exclude it from Division / Substation)
@@ -202,33 +228,52 @@ def parse_circle_tab_row2(df_raw, tab_name="UNKNOWN"):
 
     # 2. Identify Division Column
     col_div = pick_col(
-        [r"\bdivision\b", r"\bdiv\b", r"\bdn\b", r"name of div"],
-        exclude_patterns=["sub", "code", "circle"],
+        [r"\bname of div", r"\bdivision\b", r"\bdiv\b", r"\bdn\b"],
+        exclude_patterns=["sub", "code", "circle", "lat", "long"],
         validator_fn=lambda c: not is_circle_column(c)
     )
 
     # 3. Identify 33kV Source Feeder Name & Code
-    col_33code = pick_col([r"33\s*kv.*code", r"33kv.*code", r"feeder code.*33"])
+    col_33code = pick_col(
+        [r"33\s*kv.*feeder.*code", r"33\s*kv.*code", r"33kv.*code", r"feeder code.*33"],
+        exclude_patterns=["33/11", "s/s", "substation", "lat", "long"]
+    )
     col_33fdr = pick_col(
-        [r"33\s*kv.*feeder", r"33kv.*feeder", r"33\s*kv.*fdr", r"33kv.*fdr", r"name of 33"],
-        exclude_patterns=["code", "11", "s/s", "substation"]
+        [r"name of.*33\s*kv.*feeder", r"33\s*kv.*feeder", r"33kv.*feeder", r"33\s*kv.*fdr", r"33kv.*fdr", r"name of 33"],
+        exclude_patterns=["code", "33/11", "11kv", "11 kv", "s/s", "substation", "lat", "long"]
     )
 
-    # 4. Identify 33/11kV Substation Code & Name
-    col_sscode = pick_col(
-        [r"s/s.*code", r"ss.*code", r"substation.*code", r"sub-station.*code", r"33/11.*code"],
-        exclude_patterns=["11kv", "11 kv", "33kv", "33 kv", "feeder"]
-    )
+    # 4. Identify 33/11kV Substation Name ("Name of Associated 33/11KV S/s") & Code
     col_ss = pick_col(
-        [r"33/11\s*kv.*s/s", r"33/11.*substation", r"name of.*s/s", r"name of.*substation", r"\bsubstation\b", r"\bs/s\b"],
-        exclude_patterns=["code", "132", "33kv feeder", "11kv", "11 kv", "ptr", "capacity", "vcb"],
-        validator_fn=lambda c: not is_circle_column(c)
+        [
+            r"name\s*of\s*associated\s*33\s*/\s*11\s*kv\s*s\s*/\s*s",
+            r"associated\s*33\s*/\s*11\s*kv\s*s\s*/\s*s",
+            r"name\s*of.*33\s*/\s*11\s*kv.*s\s*/\s*s",
+            r"name\s*of.*33\s*/\s*11.*substation",
+            r"33\s*/\s*11\s*kv.*s\s*/\s*s",
+            r"33\s*/\s*11.*substation",
+            r"name\s*of.*s\s*/\s*s",
+            r"name\s*of.*substation",
+            r"\bsubstation\b",
+            r"\bs/s\b",
+        ],
+        exclude_patterns=[
+            "code", "132", "33kv feeder", "33 kv feeder",
+            "11kv feeder", "11 kv feeder", "11kv fdr", "11 kv fdr",
+            "ptr", "capacity", "vcb", "lat", "long", "coord", "gps", "location"
+        ],
+        validator_fn=is_valid_substation_column
+    )
+
+    col_sscode = pick_col(
+        [r"33\s*/\s*11.*s\s*/\s*s.*code", r"s\s*/\s*s.*code", r"ss.*code", r"substation.*code", r"sub-station.*code", r"33\s*/\s*11.*code"],
+        exclude_patterns=["11kv feeder", "11 kv feeder", "33kv feeder", "33 kv feeder", "feeder", "fdr", "lat", "long"]
     )
 
     # 5. Identify PTR Capacity (MVA) Column
     col_ptr = pick_col(
         [r"ptr.*cap", r"capacity", r"\bmva\b", r"ptr.*mva", r"transformer.*cap", r"\bptr\b"],
-        exclude_patterns=["vcb", "status", "remark", "make", "code", "loading", "amp"],
+        exclude_patterns=["vcb", "status", "remark", "make", "code", "loading", "amp", "lat", "long"],
         validator_fn=is_valid_ptr_column
     )
     if not col_ptr:
@@ -240,18 +285,18 @@ def parse_circle_tab_row2(df_raw, tab_name="UNKNOWN"):
 
     # 6. Identify 11kV Outgoing Feeder Code & Name
     col_11code = pick_col(
-        [r"11\s*kv.*code", r"11kv.*code", r"feeder.*code", r"fdr.*code", r"\bcode\b"],
-        exclude_patterns=["33", "s/s", "ss", "substation", "div"]
+        [r"11\s*kv.*feeder.*code", r"11\s*kv.*code", r"11kv.*code", r"feeder.*code", r"fdr.*code", r"\bcode\b"],
+        exclude_patterns=["33", "s/s", "ss", "substation", "div", "lat", "long"]
     )
     col_11fdr = pick_col(
-        [r"11\s*kv.*feeder", r"11kv.*feeder", r"11\s*kv.*fdr", r"11kv.*fdr", r"outgoing.*feeder", r"feeder.*name", r"\bfeeder\b"],
-        exclude_patterns=["33", "code", "s/s", "substation", "ptr", "vcb"]
+        [r"name of.*11\s*kv.*feeder", r"11\s*kv.*feeder", r"11kv.*feeder", r"11\s*kv.*fdr", r"11kv.*fdr", r"outgoing.*feeder", r"feeder.*name", r"\bfeeder\b"],
+        exclude_patterns=["33", "code", "s/s", "substation", "ptr", "vcb", "lat", "long"]
     )
 
     # 7. Identify Peak Load (Amps) Column
     col_load = pick_col(
         [r"peak.*load", r"max.*load", r"load.*amp", r"current", r"\bamp\b", r"peak"],
-        exclude_patterns=["vcb", "status", "remark", "code", "name", "mva"]
+        exclude_patterns=["vcb", "status", "remark", "code", "name", "mva", "lat", "long"]
     )
 
     # Forward-fill hierarchical parent columns across merged rows
@@ -264,7 +309,10 @@ def parse_circle_tab_row2(df_raw, tab_name="UNKNOWN"):
         ss_val = str(r[col_ss]).strip() if col_ss and pd.notna(r[col_ss]) else ""
         if not ss_val or ss_val.lower() in ("nan", "none", "total", "grand total", "s.no", "sr.no"):
             continue
-        if any(w in ss_val.lower() for w in ["name of", "substation", "33/11 kv", "s/s name"]):
+        if any(w in ss_val.lower() for w in ["name of", "substation", "33/11 kv", "33/11kv", "s/s name", "latitude", "longitude"]):
+            continue
+        # Guard against stray coordinate rows
+        if re.match(r"^-?\d+(?:\.\d+)?$", ss_val):
             continue
 
         div_val = str(r[col_div]).strip().upper() if col_div and pd.notna(r[col_div]) else f"{circle_clean} DIVISION"
@@ -351,7 +399,7 @@ def expand_missing_11kv_feeders(df_master):
 
 
 @st.cache_data(ttl=600, show_spinner=False)
-def load_company_peak_load_database(sheet_url):
+def load_company_peak_load_database(sheet_url, schema_version="v2_associated_33_11kv_ss"):
     sheet_id = extract_sheet_id(sheet_url)
     all_dfs = []
     loaded_tabs = []
@@ -738,7 +786,7 @@ df_div = df_cir[df_cir["division"] == selected_division]
 
 with dd3:
     substations_list = sorted(df_div["substation"].dropna().unique().tolist())
-    selected_substation = st.selectbox("3️⃣ Select 33/11kV Substation", substations_list, index=0)
+    selected_substation = st.selectbox("3️⃣ Name of Associated 33/11KV S/s", substations_list, index=0)
 
 df_ss = df_div[df_div["substation"] == selected_substation]
 
@@ -790,7 +838,7 @@ ptr_data = calculate_ptr_parameters(33.0, 11.0, active_ptr_mva, ptr_z_pct, ngr_o
 st.info(
     f"**Selected Hierarchy:** Circle: `{selected_circle}` ➔ Target Division Tab: **`{active_division}`** ➔ "
     f"Source 33kV Feeder: `{active_33kv_fdr} ({active_33kv_code})` ➔ "
-    f"33/11kV S/S: `{active_ss_name} (SS Code: {active_ss_code})` ➔ "
+    f"Associated 33/11kV S/S: `{active_ss_name} (SS Code: {active_ss_code})` ➔ "
     f"PTR: `{selected_ptr_label}` (`%Z = {ptr_z_pct}%`) ➔ "
     f"Active 11kV Feeder Code: **`{active_11kv_code}`** (`{active_11kv_name}` | Peak Load: `{active_11kv_load} A`)"
 )
