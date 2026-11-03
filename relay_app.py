@@ -15,12 +15,9 @@ import streamlit as st
 DEFAULT_PEAK_LOAD_SHEET_URL = (
     "https://docs.google.com/spreadsheets/d/1Cr3bHdLWR53skYROA4ZgGMScCjm0QHMAuvHKdIrnLvk/edit?usp=drivesdk"
 )
-
 TARGET_OUTPUT_SHEET_URL = (
     "https://docs.google.com/spreadsheets/d/1gd11j6eF6Qx4pB2Ckdf9iF7DoeBCD15Cl179Z0VnIxs/edit?usp=sharing"
 )
-
-# Updated GAS Web App Link
 DEFAULT_GAS_WEBHOOK_URL = (
     "https://script.google.com/macros/s/AKfycbwyWsu97iR--0gOaTwrpELAtNW-6ZHK6Qf0CNFFlRWdsW0Ltn3FFf6Ac-f6CmbkFyN5/exec"
 )
@@ -55,83 +52,56 @@ FEEDER_COLORS = ["#d32f2f", "#f57c00", "#7b1fa2", "#00796b", "#c2185b", "#5d4037
 
 
 def push_relay_schedule_to_division_tab(gas_url, payload):
-    """Pushes relay setting rows to the target Google Sheet under the active Division tab."""
     if not gas_url or not str(gas_url).startswith("https://script.google.com"):
         return {"status": "error", "message": "Please paste a valid Google Apps Script Web App URL in the sidebar."}
     try:
-        resp = requests.post(
-            gas_url.strip(),
-            json=payload,
-            headers={"Content-Type": "application/json"},
-            timeout=20
-        )
-        if resp.status_code == 200:
-            return resp.json()
+        resp = requests.post(gas_url.strip(), json=payload, headers={"Content-Type": "application/json"}, timeout=20)
+        if resp.status_code == 200: return resp.json()
         return {"status": "error", "message": f"HTTP {resp.status_code}: {resp.text[:150]}"}
-    except Exception as e:
-        return {"status": "error", "message": str(e)}
-
+    except Exception as e: return {"status": "error", "message": str(e)}
 
 def extract_sheet_id(sheet_url_or_id):
     m = re.search(r"/d/([a-zA-Z0-9-_]+)", str(sheet_url_or_id))
     return m.group(1) if m else str(sheet_url_or_id).strip()
 
-
 def parse_ptr_mva_value(raw_val):
-    if pd.isna(raw_val):
-        return 5.0
+    if pd.isna(raw_val): return 5.0
     s = str(raw_val).upper().strip()
     m_to = re.search(r"(\d+(?:\.\d+)?)\s*TO\s*(\d+(?:\.\d+)?)", s)
-    if m_to:
-        return float(m_to.group(2))
+    if m_to: return float(m_to.group(2))
     m_mult = re.search(r"\d+\s*[X*]\s*(\d+(?:\.\d+)?)", s)
-    if m_mult:
-        return float(m_mult.group(1))
+    if m_mult: return float(m_mult.group(1))
     m_num = re.findall(r"\d+(?:\.\d+)?", s)
     if m_num:
         for val_str in reversed(m_num):
             v = float(val_str)
-            if v in (1.6, 2.5, 3.15, 4.0, 5.0, 6.3, 8.0, 10.0, 12.5, 16.0, 20.0):
-                return v
+            if v in (1.6, 2.5, 3.15, 4.0, 5.0, 6.3, 8.0, 10.0, 12.5, 16.0, 20.0): return v
         v0 = float(m_num[0])
-        if 1.0 <= v0 <= 50.0:
-            return v0
+        if 1.0 <= v0 <= 50.0: return v0
     return 5.0
-
 
 def recommend_standard_ct(load_or_fl_amps):
     standard_cts = [100, 150, 200, 300, 400, 600, 800, 1000, 1200]
     for ct in standard_cts:
-        if ct >= load_or_fl_amps * 1.10:
-            return float(ct)
+        if ct >= load_or_fl_amps * 1.10: return float(ct)
     return 600.0
 
-
 def parse_circle_tab_row2(df_raw, tab_name="UNKNOWN"):
-    if df_raw is None or len(df_raw) < 3:
-        return pd.DataFrame()
-
+    if df_raw is None or len(df_raw) < 3: return pd.DataFrame()
     circle_clean = tab_name.strip().upper()
 
     header_idx = 1
     for candidate_idx in [1, 0, 2, 3]:
         if candidate_idx < len(df_raw):
-            row_vals = [str(x).strip().lower() for x in df_raw.iloc[candidate_idx].values if pd.notna(x)]
-            row_str = " ".join(row_vals)
+            row_str = " ".join([str(x).strip().lower() for x in df_raw.iloc[candidate_idx].values if pd.notna(x)])
             if sum(1 for k in ["division", "substation", "s/s", "feeder", "ptr", "mva", "capacity", "code"] if k in row_str) >= 2:
-                header_idx = candidate_idx
-                break
+                header_idx = candidate_idx; break
 
     raw_cols = []
     for col_i in range(df_raw.shape[1]):
         h_main = str(df_raw.iloc[header_idx, col_i]).strip() if pd.notna(df_raw.iloc[header_idx, col_i]) else ""
         h_prev = str(df_raw.iloc[header_idx - 1, col_i]).strip() if (header_idx > 0 and pd.notna(df_raw.iloc[header_idx - 1, col_i])) else ""
-        if h_main.lower() in ("nan", "none"):
-            h_main = ""
-        if h_prev.lower() in ("nan", "none"):
-            h_prev = ""
-        col_label = h_main if h_main else (h_prev if h_prev else f"col_{col_i}")
-        raw_cols.append(col_label)
+        raw_cols.append(h_main if h_main.lower() not in ("nan", "none", "") else (h_prev if h_prev.lower() not in ("nan", "none", "") else f"col_{col_i}"))
 
     df = df_raw.iloc[header_idx + 1:].copy()
     seen = {}
@@ -141,9 +111,7 @@ def parse_circle_tab_row2(df_raw, tab_name="UNKNOWN"):
         clean_cols.append(f"{c}_{seen[c]}" if seen[c] > 1 else c)
     df.columns = clean_cols
     df = df.dropna(how="all")
-
-    if df.empty:
-        return pd.DataFrame()
+    if df.empty: return pd.DataFrame()
 
     def sample_vals(col_name, n=25):
         return [str(x).strip() for x in df[col_name].dropna().head(n).tolist() if str(x).strip().lower() not in ("nan", "none", "")]
@@ -162,32 +130,29 @@ def parse_circle_tab_row2(df_raw, tab_name="UNKNOWN"):
         if is_circle_column(col_name): return False
         vals = sample_vals(col_name)
         if not vals: return False
-        alpha_count, coord_or_num_count = 0, 0
+        a, n = 0, 0
         for v in vals:
-            if re.match(r"^-?\d+(?:\.\d+)?$", v): coord_or_num_count += 1
-            elif re.search(r"[A-Za-z]", v): alpha_count += 1
-        if (coord_or_num_count / len(vals)) > 0.30: return False
-        return (alpha_count / len(vals)) >= 0.50
+            if re.match(r"^-?\d+(?:\.\d+)?$", v): n += 1
+            elif re.search(r"[A-Za-z]", v): a += 1
+        return False if (n / len(vals)) > 0.30 else (a / len(vals)) >= 0.50
 
     def is_valid_ptr_column(col_name):
         vals = sample_vals(col_name)
         if not vals: return False
-        mva_hits = 0
+        m_hits = 0
         for v in vals:
             vu = v.upper()
             if any(bad in vu for bad in ["VCB", "WORKING", "DEFECTIVE", "BYPASS", "MAKE", "REMARK"]): return False
-            if re.search(r"\b(1\.6|2\.5|3\.15|4\.0|5|5\.0|6\.3|8|8\.0|10|10\.0|12\.5)\b", vu): mva_hits += 1
-        return (mva_hits / len(vals)) >= 0.35
+            if re.search(r"\b(1\.6|2\.5|3\.15|4\.0|5|5\.0|6\.3|8|8\.0|10|10\.0|12\.5)\b", vu): m_hits += 1
+        return (m_hits / len(vals)) >= 0.35
 
     used_cols = set()
-
     def pick_col(header_patterns, exclude_patterns=None, validator_fn=None):
-        exclude_patterns = exclude_patterns or []
         for pat in header_patterns:
             for col in df.columns:
                 if col in used_cols: continue
                 cl = re.sub(r"\s+", " ", col.lower()).strip()
-                if any(ex in cl for ex in exclude_patterns): continue
+                if any(ex in cl for ex in (exclude_patterns or [])): continue
                 if re.search(pat, cl):
                     if validator_fn is None or validator_fn(col):
                         used_cols.add(col)
@@ -197,57 +162,38 @@ def parse_circle_tab_row2(df_raw, tab_name="UNKNOWN"):
     col_circle = pick_col([r"\bcircle\b", r"\bdistrict\b"], validator_fn=is_circle_column)
     if not col_circle:
         for col in df.columns:
-            if is_circle_column(col):
-                col_circle = col; used_cols.add(col); break
+            if is_circle_column(col): col_circle = col; used_cols.add(col); break
     
-    col_div = pick_col(
-        [r"name\s*of.*division", r"name\s*of.*city.*division", r"city/o.?m.*division", r"\bdivision\b"],
-        exclude_patterns=["substation", "s/s", "feeder", "code", "lat", "long", "sub-division", "sub division", "sub_division"]
-    )
-
+    col_div = pick_col([r"name\s*of.*division", r"name\s*of.*city.*division", r"city/o.?m.*division", r"\bdivision\b"], exclude_patterns=["substation", "s/s", "feeder", "code", "lat", "long", "sub-division", "sub division", "sub_division"])
     col_33code = pick_col([r"33\s*kv.*feeder.*code", r"33\s*kv.*code", r"33kv.*code", r"feeder code.*33"], exclude_patterns=["33/11", "s/s", "substation", "lat", "long"])
     col_33fdr = pick_col([r"name of.*33\s*kv.*feeder", r"33\s*kv.*feeder", r"33kv.*feeder", r"33\s*kv.*fdr", r"33kv.*fdr", r"name of 33"], exclude_patterns=["code", "33/11", "11kv", "11 kv", "s/s", "substation", "lat", "long"])
-
-    col_ss = pick_col(
-        [r"name\s*of\s*associated\s*33\s*/\s*11\s*kv\s*s\s*/\s*s", r"associated\s*33\s*/\s*11\s*kv\s*s\s*/\s*s", r"name\s*of.*33\s*/\s*11\s*kv.*s\s*/\s*s", r"name\s*of.*33\s*/\s*11.*substation", r"33\s*/\s*11\s*kv.*s\s*/\s*s", r"33\s*/\s*11.*substation", r"name\s*of.*s\s*/\s*s", r"name\s*of.*substation", r"\bsubstation\b", r"\bs/s\b"],
-        exclude_patterns=["code", "132", "33kv feeder", "33 kv feeder", "11kv feeder", "11 kv feeder", "11kv fdr", "11 kv fdr", "ptr", "capacity", "vcb", "lat", "long", "coord", "gps", "location"], validator_fn=is_valid_substation_column
-    )
-
+    col_ss = pick_col([r"name\s*of\s*associated\s*33\s*/\s*11\s*kv\s*s\s*/\s*s", r"associated\s*33\s*/\s*11\s*kv\s*s\s*/\s*s", r"name\s*of.*33\s*/\s*11\s*kv.*s\s*/\s*s", r"name\s*of.*33\s*/\s*11.*substation", r"33\s*/\s*11\s*kv.*s\s*/\s*s", r"33\s*/\s*11.*substation", r"name\s*of.*s\s*/\s*s", r"name\s*of.*substation", r"\bsubstation\b", r"\bs/s\b"], exclude_patterns=["code", "132", "33kv feeder", "33 kv feeder", "11kv feeder", "11 kv feeder", "11kv fdr", "11 kv fdr", "ptr", "capacity", "vcb", "lat", "long", "coord", "gps", "location"], validator_fn=is_valid_substation_column)
     col_sscode = pick_col([r"33\s*/\s*11.*s\s*/\s*s.*code", r"s\s*/\s*s.*code", r"ss.*code", r"substation.*code", r"sub-station.*code", r"33\s*/\s*11.*code"], exclude_patterns=["11kv feeder", "11 kv feeder", "33kv feeder", "33 kv feeder", "feeder", "fdr", "lat", "long"])
-
     col_ptr = pick_col([r"ptr.*cap", r"capacity", r"\bmva\b", r"ptr.*mva", r"transformer.*cap", r"\bptr\b"], exclude_patterns=["vcb", "status", "remark", "make", "code", "loading", "amp", "lat", "long"], validator_fn=is_valid_ptr_column)
     if not col_ptr:
         for col in df.columns:
-            if col not in used_cols and is_valid_ptr_column(col):
-                col_ptr = col; used_cols.add(col); break
+            if col not in used_cols and is_valid_ptr_column(col): col_ptr = col; used_cols.add(col); break
 
     col_11code = pick_col([r"11\s*kv.*feeder.*code", r"11\s*kv.*code", r"11kv.*code", r"feeder.*code", r"fdr.*code", r"\bcode\b"], exclude_patterns=["33", "s/s", "ss", "substation", "div", "lat", "long"])
     col_11fdr = pick_col([r"name of.*11\s*kv.*feeder", r"11\s*kv.*feeder", r"11kv.*feeder", r"11\s*kv.*fdr", r"11kv.*fdr", r"outgoing.*feeder", r"feeder.*name", r"\bfeeder\b"], exclude_patterns=["33", "code", "s/s", "substation", "ptr", "vcb", "lat", "long"])
     col_load = pick_col([r"peak.*load", r"max.*load", r"load.*amp", r"current", r"\bamp\b", r"peak"], exclude_patterns=["vcb", "status", "remark", "code", "name", "mva", "lat", "long"])
 
-    for parent_col in [col_div, col_33fdr, col_33code, col_ss, col_sscode, col_ptr]:
-        if parent_col and parent_col in df.columns: df[parent_col] = df[parent_col].ffill()
+    for p in [col_div, col_33fdr, col_33code, col_ss, col_sscode, col_ptr]:
+        if p and p in df.columns: df[p] = df[p].ffill()
 
     records = []
     for idx, r in df.iterrows():
         ss_val = str(r[col_ss]).strip() if col_ss and pd.notna(r[col_ss]) else ""
-        if not ss_val or ss_val.lower() in ("nan", "none", "total", "grand total", "s.no", "sr.no"): continue
-        if any(w in ss_val.lower() for w in ["name of", "substation", "33/11 kv", "33/11kv", "s/s name", "latitude", "longitude"]): continue
-        if re.match(r"^-?\d+(?:\.\d+)?$", ss_val): continue
-
+        if not ss_val or ss_val.lower() in ("nan", "none", "total", "grand total", "s.no", "sr.no") or any(w in ss_val.lower() for w in ["name of", "substation", "33/11 kv", "s/s name", "latitude"]) or re.match(r"^-?\d+(?:\.\d+)?$", ss_val): continue
         div_val = str(r[col_div]).strip().upper() if col_div and pd.notna(r[col_div]) else f"{circle_clean} DIVISION"
         if div_val.lower() in ("nan", "none", ""): div_val = f"{circle_clean} DIVISION"
-
         f33_val = str(r[col_33fdr]).strip() if col_33fdr and pd.notna(r[col_33fdr]) else f"33kV {ss_val} Feeder"
         f33_code = str(r[col_33code]).strip().split(".")[0] if col_33code and pd.notna(r[col_33code]) else f"33F-{ss_val[:4].upper()}"
         sscode_val = str(r[col_sscode]).strip().split(".")[0] if col_sscode and pd.notna(r[col_sscode]) else f"SS-{idx}"
-
         ptr_raw = str(r[col_ptr]).strip() if col_ptr and pd.notna(r[col_ptr]) else "5.0 MVA"
         ptr_mva = parse_ptr_mva_value(ptr_raw)
         ptr_label = f"{ptr_mva:g} MVA ({ptr_raw})" if (ptr_raw and str(ptr_mva) not in ptr_raw and "vcb" not in ptr_raw.lower()) else f"{ptr_mva:g} MVA"
-
-        f11_val = str(r[col_11fdr]).strip() if col_11fdr and pd.notna(r[col_11fdr]) else ""
-        f11_code = str(r[col_11code]).strip().split(".")[0] if col_11code and pd.notna(r[col_11code]) else ""
+        f11_val, f11_code = str(r[col_11fdr]).strip() if col_11fdr and pd.notna(r[col_11fdr]) else "", str(r[col_11code]).strip().split(".")[0] if col_11code and pd.notna(r[col_11code]) else ""
         if f11_val.lower() in ("nan", "none"): f11_val = ""
         if f11_code.lower() in ("nan", "none"): f11_code = ""
 
@@ -255,8 +201,8 @@ def parse_circle_tab_row2(df_raw, tab_name="UNKNOWN"):
         if col_load and pd.notna(r[col_load]):
             m_ld = re.findall(r"\d+(?:\.\d+)?", str(r[col_load]))
             if m_ld:
-                val_f = float(m_ld[0])
-                if 1.0 <= val_f <= 1500.0: load_amps = val_f
+                v_f = float(m_ld[0])
+                if 1.0 <= v_f <= 1500.0: load_amps = v_f
 
         records.append({
             "circle": circle_clean, "division": div_val, "feeder_33kv": f33_val, "feeder_33kv_code": f33_code,
@@ -265,13 +211,10 @@ def parse_circle_tab_row2(df_raw, tab_name="UNKNOWN"):
         })
     return pd.DataFrame(records)
 
-
 def expand_missing_11kv_feeders(df_master):
     if df_master.empty: return df_master
     expanded_rows = []
-    grouped = df_master.groupby(["circle", "division", "substation", "ptr_label"], sort=False)
-
-    for (_, _, ss_name, _), grp in grouped:
+    for (_, _, ss_name, _), grp in df_master.groupby(["circle", "division", "substation", "ptr_label"], sort=False):
         has_11kv = grp[grp["feeder_11kv_code"].astype(str).str.strip() != ""]
         if not has_11kv.empty:
             for _, row in grp.iterrows():
@@ -281,66 +224,42 @@ def expand_missing_11kv_feeders(df_master):
                 expanded_rows.append(r_dict)
         else:
             base = grp.iloc[0].to_dict()
-            mva = float(base["ptr_mva"])
-            ss_code = str(base["ss_code"])
-            i_fl_11kv = (mva * 1e6) / (math.sqrt(3) * 11000.0)
-            templates = [("01", "Town / Abadi", 0.34), ("02", "Industrial / Commercial", 0.28), ("03", "Agriculture (DLF-1)", 0.22), ("04", "Rural / Mixed (DLF-2)", 0.16)]
-            for suf_code, suf_name, share in templates:
-                r_copy = dict(base)
-                r_copy["feeder_11kv_code"] = f"{ss_code}-11F{suf_code}"
-                r_copy["feeder_11kv"] = f"11kV {ss_name.title()} {suf_name}"
-                r_copy["peak_load_amps"] = max(35.0, round(i_fl_11kv * share, 0))
-                expanded_rows.append(r_copy)
+            i_fl = (float(base["ptr_mva"]) * 1e6) / (math.sqrt(3) * 11000.0)
+            for sc, sn, sh in [("01", "Town", 0.34), ("02", "Industrial", 0.28), ("03", "Agriculture", 0.22), ("04", "Mixed", 0.16)]:
+                rc = dict(base)
+                rc["feeder_11kv_code"], rc["feeder_11kv"], rc["peak_load_amps"] = f"{base['ss_code']}-11F{sc}", f"11kV {ss_name.title()} {sn}", max(35.0, round(i_fl * sh, 0))
+                expanded_rows.append(rc)
     return pd.DataFrame(expanded_rows)
 
-
 @st.cache_data(ttl=600, show_spinner=False)
-def load_company_peak_load_database(sheet_url, schema_version="v2_associated_33_11kv_ss"):
+def load_company_peak_load_database(sheet_url):
     sheet_id = extract_sheet_id(sheet_url)
     all_dfs, loaded_tabs = [], []
-    xlsx_url = f"https://docs.google.com/spreadsheets/d/{sheet_id}/export?format=xlsx"
     try:
-        resp = requests.get(xlsx_url, timeout=15)
+        resp = requests.get(f"https://docs.google.com/spreadsheets/d/{sheet_id}/export?format=xlsx", timeout=15)
         if resp.status_code == 200 and resp.content[:2] == b"PK":
             xls = pd.ExcelFile(io.BytesIO(resp.content))
-            for tab_name in xls.sheet_names:
-                if "wp" in tab_name.lower(): continue
-                df_tab_raw = pd.read_excel(xls, sheet_name=tab_name, header=None)
-                df_norm = parse_circle_tab_row2(df_tab_raw, tab_name=tab_name)
-                if not df_norm.empty:
-                    all_dfs.append(df_norm); loaded_tabs.append(tab_name)
-    except Exception: pass
-
+            for tn in xls.sheet_names:
+                if "wp" in tn.lower(): continue
+                df_n = parse_circle_tab_row2(pd.read_excel(xls, sheet_name=tn, header=None), tab_name=tn)
+                if not df_n.empty: all_dfs.append(df_n); loaded_tabs.append(tn)
+    except: pass
     if not all_dfs:
         for tab in KNOWN_MPEZ_CIRCLE_TABS:
-            encoded_tab = urllib.parse.quote(tab)
-            csv_url = f"https://docs.google.com/spreadsheets/d/{sheet_id}/gviz/tq?tqx=out:csv&sheet={encoded_tab}"
             try:
-                r_csv = requests.get(csv_url, timeout=6)
+                r_csv = requests.get(f"https://docs.google.com/spreadsheets/d/{sheet_id}/gviz/tq?tqx=out:csv&sheet={urllib.parse.quote(tab)}", timeout=6)
                 if r_csv.status_code == 200 and "html" not in r_csv.text[:100].lower():
-                    df_raw = pd.read_csv(io.StringIO(r_csv.text), header=None)
-                    df_norm = parse_circle_tab_row2(df_raw, tab_name=tab)
-                    if not df_norm.empty:
-                        all_dfs.append(df_norm); loaded_tabs.append(tab)
-            except Exception: continue
-
-    if all_dfs:
-        master_df = expand_missing_11kv_feeders(pd.concat(all_dfs, ignore_index=True).drop_duplicates())
-        return master_df, loaded_tabs, "LIVE_GSHEET"
-
-    seed_substations = [
-        ("CHHINDWARA", "CHHINDWARA CITY", "33kV Pachmadhi Feeder", "33F-5155", "PACHMADHIIDHANA", "5155", "3.15 MVA (PTR-1)", 3.15),
-        ("JABALPUR CITY", "EAST, JABALPUR", "33kV Gohalpur Feeder", "33F-1341", "GOHALPUR", "1341", "10 MVA (PTR-1)", 10.0),
-    ]
-    fallback_rows = []
-    for cir, div, f33, c33, ss, ssc, ptr_lbl, mva in seed_substations:
-        fallback_rows.append({"circle": cir, "division": div, "feeder_33kv": f33, "feeder_33kv_code": c33, "substation": ss, "ss_code": ssc, "ptr_label": ptr_lbl, "ptr_mva": mva, "feeder_11kv": "", "feeder_11kv_code": "", "peak_load_amps": round(mva * 28.0, 1)})
-    master_fallback = expand_missing_11kv_feeders(pd.DataFrame(fallback_rows))
-    return master_fallback, KNOWN_MPEZ_CIRCLE_TABS, "EMBEDDED_FALLBACK"
+                    df_n = parse_circle_tab_row2(pd.read_csv(io.StringIO(r_csv.text), header=None), tab_name=tab)
+                    if not df_n.empty: all_dfs.append(df_n); loaded_tabs.append(tab)
+            except: continue
+    if all_dfs: return expand_missing_11kv_feeders(pd.concat(all_dfs, ignore_index=True).drop_duplicates()), loaded_tabs, "LIVE_GSHEET"
+    
+    seeds = [("CHHINDWARA", "CHHINDWARA CITY", "33kV Pachmadhi Feeder", "33F-5155", "PACHMADHIIDHANA", "5155", "3.15 MVA (PTR-1)", 3.15), ("JABALPUR CITY", "EAST, JABALPUR", "33kV Gohalpur Feeder", "33F-1341", "GOHALPUR", "1341", "10 MVA (PTR-1)", 10.0)]
+    return expand_missing_11kv_feeders(pd.DataFrame([{"circle": c, "division": d, "feeder_33kv": f, "feeder_33kv_code": fc, "substation": s, "ss_code": sc, "ptr_label": pl, "ptr_mva": m, "feeder_11kv": "", "feeder_11kv_code": "", "peak_load_amps": round(m*28.0, 1)} for c, d, f, fc, s, sc, pl, m in seeds])), KNOWN_MPEZ_CIRCLE_TABS, "FALLBACK"
 
 
 # ---------------------------------------------------------
-# 2. PROTECTION MATH & COORDINATION FUNCTIONS
+# 2. PROTECTION MATH & HIGH-SET COORDINATION FUNCTIONS
 # ---------------------------------------------------------
 def get_default_ptr_z_pct(ptr_mva):
     if ptr_mva <= 3.15: return 6.25
@@ -348,21 +267,17 @@ def get_default_ptr_z_pct(ptr_mva):
     elif ptr_mva <= 8.0: return 8.35
     return 9.00
 
-
-def calc_idmt_time(fault_current, pickup_current, tms, curve_constant):
+def calc_idmt_time(fault_current, pickup_current, tms, curve_constant, alpha=0.02):
     if not pickup_current or pickup_current <= 0 or not tms or tms <= 0: return None
     psm = fault_current / pickup_current
     if psm <= 1.0: return None
-    return (curve_constant / ((psm ** 0.02) - 1.0)) * tms
+    return (curve_constant / ((psm ** alpha) - 1.0)) * tms
 
-
-def calc_required_tms(fault_current, pickup_current, target_time_sec, curve_constant, min_tms=0.025, max_tms=1.2):
+def calc_required_tms(fault_current, pickup_current, target_time_sec, curve_constant, alpha=0.02, min_tms=0.025, max_tms=1.2):
     if not pickup_current or pickup_current <= 0 or fault_current <= pickup_current or target_time_sec <= 0: return None
     psm = fault_current / pickup_current
-    raw_tms = (target_time_sec * ((psm ** 0.02) - 1.0)) / curve_constant
-    clamped_tms = max(min_tms, min(max_tms, raw_tms))
-    return {"psm": round(psm, 2), "raw_tms": round(raw_tms, 3), "recommended_tms": round(clamped_tms, 3)}
-
+    raw_tms = (target_time_sec * ((psm ** alpha) - 1.0)) / curve_constant
+    return {"psm": round(psm, 2), "raw_tms": round(raw_tms, 3), "recommended_tms": round(max(min_tms, min(max_tms, raw_tms)), 3)}
 
 def calc_composite_time(fault_current, idmt_pickup, tms, curve_constant, hs_enabled=False, hs_pickup=None, hs_delay_sec=0.05):
     t_idmt = calc_idmt_time(fault_current, idmt_pickup, tms, curve_constant)
@@ -370,160 +285,78 @@ def calc_composite_time(fault_current, idmt_pickup, tms, curve_constant, hs_enab
         return min(t_idmt, hs_delay_sec) if t_idmt is not None else hs_delay_sec
     return t_idmt
 
+def calculate_highset_for_margin_drop(up_pickup, up_tms, down_pickup, down_tms, curve_constant=0.14, target_margin_sec=0.100, max_fault_amps=20000):
+    """Numerically solves for the current (A) where IDMT grading margin compresses below 100ms."""
+    low, high = max(up_pickup, down_pickup) * 1.01, max_fault_amps
+    m_high = calc_idmt_time(high, up_pickup, up_tms, curve_constant) - calc_idmt_time(high, down_pickup, down_tms, curve_constant)
+    if m_high >= target_margin_sec: return None 
+    for _ in range(50): 
+        mid = (low + high) / 2.0
+        margin = calc_idmt_time(mid, up_pickup, up_tms, curve_constant) - calc_idmt_time(mid, down_pickup, down_tms, curve_constant)
+        if margin > target_margin_sec: low = mid
+        else: high = mid
+    return round(mid, 0)
+
+def recommend_highsets(zone, ptr_data, feeder_reach_fault=0, fdr_50_delay=0.05, cti_sec=0.15):
+    """Utility Logic Engine for Definite-Time High-Set Rules (ANSI 50/50N)"""
+    if zone == "feeder":
+        # Reach-based (typically 80% of line impedance)
+        return {"50_pickup": round(feeder_reach_fault, -1), "50_delay": 0.05, "50N_pickup": round(feeder_reach_fault * 0.4, 0), "50N_delay": 0.05}
+    elif zone == "ptr_lv":
+        # DT Backup for bus faults. Must wait for feeder instantaneous to act + CTI.
+        return {"50_pickup": round(ptr_data["max_3ph_sc_lv_A"] * 0.85, -1), "50_delay": fdr_50_delay + cti_sec, "50N_pickup": round(ptr_data["max_ef_lv_A"] * 0.90, 0), "50N_delay": fdr_50_delay + cti_sec}
+    elif zone == "ptr_hv":
+        # Pure Amplitude Graded above max 11kV side through-fault (referred to 33kV side)
+        hv_referred_max = ptr_data["max_3ph_sc_hv_A"]
+        return {"50_pickup": round(hv_referred_max * 1.25, -1), "50_delay": 0.05, "50N_pickup": None, "50N_delay": None} # Delta winding no 50N
+    return {}
 
 def calculate_ptr_parameters(v_hv_kv, v_lv_kv, ptr_mva, ptr_z_pct, ngr_ohms, ct_lv_pri, ct_hv_pri):
     turn_ratio = v_hv_kv / v_lv_kv
-    v_lv_ln_volts = (v_lv_kv * 1000.0) / math.sqrt(3)
-    i_fl_lv = (ptr_mva * 1e6) / (math.sqrt(3) * v_lv_kv * 1000.0)
-    i_fl_hv = (ptr_mva * 1e6) / (math.sqrt(3) * v_hv_kv * 1000.0)
-
+    v_lv_ln = (v_lv_kv * 1000.0) / math.sqrt(3)
+    i_fl_lv, i_fl_hv = (ptr_mva * 1e6) / (math.sqrt(3) * v_lv_kv * 1000.0), (ptr_mva * 1e6) / (math.sqrt(3) * v_hv_kv * 1000.0)
     z_pu = ptr_z_pct / 100.0
-    i_sc_3ph_lv = i_fl_lv / z_pu
-    i_sc_3ph_hv = i_fl_hv / z_pu
-
+    i_sc_3ph_lv, i_sc_3ph_hv = i_fl_lv / z_pu, i_fl_hv / z_pu
     z_ptr_ohms = ((v_lv_kv ** 2) / ptr_mva) * z_pu
     r_ptr_ohms = z_ptr_ohms / math.sqrt(1 + 10**2)
     x_ptr_ohms = r_ptr_ohms * 10.0
     dyn11_lg_hv_factor = 1.0 / (math.sqrt(3) * turn_ratio)
 
-    if ngr_ohms and ngr_ohms > 0:
-        max_ef_lv = v_lv_ln_volts / ngr_ohms
-        rec_51g_pickup = max_ef_lv * 0.20
-    else:
-        max_ef_lv = i_sc_3ph_lv
-        rec_51g_pickup = ct_lv_pri * 0.20
+    max_ef_lv = (v_lv_ln / ngr_ohms) if ngr_ohms > 0 else i_sc_3ph_lv
+    rec_51g_pickup = (max_ef_lv * 0.20) if ngr_ohms > 0 else (ct_lv_pri * 0.20)
 
-    max_ef_reflected_hv_line = max_ef_lv * dyn11_lg_hv_factor
-
-    return {
-        "turn_ratio": round(turn_ratio, 3), "v_lv_ln_volts": round(v_lv_ln_volts, 1),
-        "r_ptr_ohms": r_ptr_ohms, "x_ptr_ohms": x_ptr_ohms, "z_ptr_ohms": round(z_ptr_ohms, 4),
-        "i_fl_lv_A": round(i_fl_lv, 2), "i_fl_hv_A": round(i_fl_hv, 2),
-        "max_3ph_sc_lv_A": round(i_sc_3ph_lv, 1), "max_3ph_sc_hv_A": round(i_sc_3ph_hv, 1),
-        "max_ef_lv_A": round(max_ef_lv, 2), "max_ef_reflected_hv_A": round(max_ef_reflected_hv_line, 2),
-        "rec_51g_pickup_A": round(rec_51g_pickup, 2), "rec_51g_plug_pct": round((rec_51g_pickup / ct_lv_pri) * 100.0, 2),
-        "dyn11_lg_hv_factor": dyn11_lg_hv_factor
-    }
+    return {"turn_ratio": round(turn_ratio, 3), "v_lv_ln_volts": round(v_lv_ln, 1), "r_ptr_ohms": r_ptr_ohms, "x_ptr_ohms": x_ptr_ohms, "z_ptr_ohms": round(z_ptr_ohms, 4), "i_fl_lv_A": round(i_fl_lv, 2), "i_fl_hv_A": round(i_fl_hv, 2), "max_3ph_sc_lv_A": round(i_sc_3ph_lv, 1), "max_3ph_sc_hv_A": round(i_sc_3ph_hv, 1), "max_ef_lv_A": round(max_ef_lv, 2), "max_ef_reflected_hv_A": round(max_ef_lv * dyn11_lg_hv_factor, 2), "rec_51g_pickup_A": round(rec_51g_pickup, 2), "dyn11_lg_hv_factor": dyn11_lg_hv_factor}
 
 def calculate_differential_settings(ptr_mva, v_hv, v_lv, hv_ct_pri, lv_ct_pri, ct_sec, ptr_z_pct):
-    """Calculates amplitude matching and settings for 87T Differential Protection"""
-    i_fl_hv = (ptr_mva * 1e6) / (math.sqrt(3) * v_hv * 1000.0)
-    i_fl_lv = (ptr_mva * 1e6) / (math.sqrt(3) * v_lv * 1000.0)
-    
-    i_sec_fl_hv = i_fl_hv / (hv_ct_pri / ct_sec)
-    i_sec_fl_lv = i_fl_lv / (lv_ct_pri / ct_sec)
-    
-    z_pu = ptr_z_pct / 100.0
-    max_through_fault_pu = 1.0 / z_pu if z_pu > 0 else 12.5
-    
-    idiff_pickup_pu = 0.20
-    idiff_highset_pu = math.ceil(max_through_fault_pu * 1.2) 
-    
-    return {
-        "i_fl_hv": round(i_fl_hv, 2), "i_fl_lv": round(i_fl_lv, 2),
-        "i_sec_fl_hv": round(i_sec_fl_hv, 3), "i_sec_fl_lv": round(i_sec_fl_lv, 3),
-        "max_through_fault_pu": round(max_through_fault_pu, 2),
-        "idiff_pickup_pu": idiff_pickup_pu,
-        "slope1_pct": 30, "slope2_pct": 80,
-        "kneepoint1_pu": 1.0, "kneepoint2_pu": 2.5,
-        "idiff_highset_pu": idiff_highset_pu,
-        "harmonic_2nd_pct": 15, "harmonic_5th_pct": 35,
-    }
-
+    i_fl_hv, i_fl_lv = (ptr_mva * 1e6) / (math.sqrt(3) * v_hv * 1000.0), (ptr_mva * 1e6) / (math.sqrt(3) * v_lv * 1000.0)
+    return {"i_fl_hv": round(i_fl_hv, 2), "i_fl_lv": round(i_fl_lv, 2), "i_sec_fl_hv": round(i_fl_hv / (hv_ct_pri / ct_sec), 3), "i_sec_fl_lv": round(i_fl_lv / (lv_ct_pri / ct_sec), 3), "max_through_fault_pu": round(1.0 / (ptr_z_pct / 100.0), 2), "idiff_pickup_pu": 0.20, "slope1_pct": 30, "slope2_pct": 80, "idiff_highset_pu": math.ceil(1.0 / (ptr_z_pct / 100.0) * 1.2), "harmonic_2nd_pct": 15, "harmonic_5th_pct": 35}
 
 def calc_fault_at_distance_km(dist_km, v_ln_volts, r_ptr, x_ptr, r1_km, x1_km):
     z_total = math.hypot(r_ptr + (r1_km * dist_km), x_ptr + (x1_km * dist_km))
     return v_ln_volts / z_total if z_total > 0 else 0.0
 
-
-def calc_ansi_50_reach_km(hs_pickup_amps, v_ln_volts, r_ptr, x_ptr, r1_km, x1_km, total_length_km):
-    if not hs_pickup_amps or hs_pickup_amps <= 0: return 0.0, 0.0
-    z_target = v_ln_volts / hs_pickup_amps
-    z_ptr = math.hypot(r_ptr, x_ptr)
-    if z_target <= z_ptr: return 0.0, 0.0
-    a, b, c = (r1_km ** 2) + (x1_km ** 2), 2.0 * ((r_ptr * r1_km) + (x_ptr * x1_km)), (r_ptr ** 2) + (x_ptr ** 2) - (z_target ** 2)
-    if a <= 0: return 0.0, 0.0
-    discriminant = (b ** 2) - (4.0 * a * c)
-    if discriminant < 0: return 0.0, 0.0
-    reach_km = (-b + math.sqrt(discriminant)) / (2.0 * a)
-    reach_pct = (reach_km / total_length_km) * 100.0 if total_length_km > 0 else 0.0
-    return round(max(0.0, reach_km), 2), round(max(0.0, reach_pct), 1)
-
-
 def evaluate_ct_saturation(zone_name, ct_primary, ct_secondary, rated_va, ct_class_str, r_ct_ohms, lead_length_m, lead_sqmm, relay_va, max_fault_primary_amps):
     alf_rated = CT_CLASS_PRESETS.get(ct_class_str, 10.0)
-    i_sec_sq = ct_secondary ** 2
-    r_b_actual = ((2.0 * lead_length_m * 0.0178) / lead_sqmm if lead_sqmm > 0 else 0.0) + (relay_va / i_sec_sq)
-    z_total_rated, z_total_actual = r_ct_ohms + (rated_va / i_sec_sq), r_ct_ohms + r_b_actual
+    r_b_actual = ((2.0 * lead_length_m * 0.0178) / lead_sqmm if lead_sqmm > 0 else 0.0) + (relay_va / (ct_secondary ** 2))
+    z_total_rated, z_total_actual = r_ct_ohms + (rated_va / (ct_secondary ** 2)), r_ct_ohms + r_b_actual
     alf_effective = alf_rated * (z_total_rated / z_total_actual) if z_total_actual > 0 else alf_rated
-    actual_fault_multiple = max_fault_primary_amps / ct_primary if ct_primary > 0 else 0.0
-    safety_ratio = alf_effective / actual_fault_multiple if actual_fault_multiple > 0 else 99.0
-    verdict = "✅ PASS (Linear / Unsaturated)" if safety_ratio >= 1.2 else ("⚠️ MARGINAL (<20% Headroom)" if safety_ratio >= 1.0 else "❌ SATURATES (Upgrade VA / Class)")
-
-    return {
-        "Zone": zone_name, "CT Ratio & Class": f"{int(ct_primary)}/{int(ct_secondary)}A ({rated_va:.0f}VA {ct_class_str})",
-        "Rated Burden Z (Ω)": round(rated_va / i_sec_sq, 3), "Actual Loop Z (Rct+Lead+Relay Ω)": round(z_total_actual, 3),
-        "Rated ALF": alf_rated, "Effective ALF (ALF_eff)": round(alf_effective, 1),
-        "Max Unsat. Current (A)": round(alf_effective * ct_primary, 0), "Max Zone Fault (A)": round(max_fault_primary_amps, 0),
-        "Actual Fault Multiple (x In)": round(actual_fault_multiple, 1),
-        "Knee EMF Vk / Req Vf (V)": f"{alf_rated * ct_secondary * z_total_rated:.1f} V / {max_fault_primary_amps * (ct_secondary / ct_primary) * z_total_actual:.1f} V",
-        "CT Saturation Verdict": verdict,
-    }
-
+    saf_ratio = alf_effective / (max_fault_primary_amps / ct_primary if ct_primary > 0 else 0.0)
+    return {"Zone": zone_name, "CT Ratio & Class": f"{int(ct_primary)}/{int(ct_secondary)}A ({rated_va:.0f}VA {ct_class_str})", "Rated Burden Z (Ω)": round(rated_va / (ct_secondary ** 2), 3), "Actual Loop Z (Rct+Lead+Relay Ω)": round(z_total_actual, 3), "Rated ALF": alf_rated, "Effective ALF (ALF_eff)": round(alf_effective, 1), "Max Unsat. Current (A)": round(alf_effective * ct_primary, 0), "Max Zone Fault (A)": round(max_fault_primary_amps, 0), "Actual Fault Multiple (x In)": round(max_fault_primary_amps / ct_primary if ct_primary > 0 else 0.0, 1), "CT Saturation Verdict": "✅ PASS (Linear / Unsaturated)" if saf_ratio >= 1.2 else ("⚠️ MARGINAL (<20% Headroom)" if saf_ratio >= 1.0 else "❌ SATURATES (Upgrade VA / Class)")}
 
 def build_curve_trace(fc_list, idmt_pickup, tms, c_const, hs_en, hs_pickup, hs_delay):
     pts = list(fc_list)
-    # Check if pts has items, then safely check bounds
     if pts and hs_en and hs_pickup and hs_pickup > pts[0] and hs_pickup <= pts[-1]:
         pts.extend([hs_pickup - 0.1, hs_pickup])
         pts = sorted(list(set(pts)))
-        
     x_vals, y_vals = [], []
     for fc in pts:
         t = calc_composite_time(fc, idmt_pickup, tms, c_const, hs_en, hs_pickup, hs_delay)
-        if t is not None: 
-            x_vals.append(fc)
-            y_vals.append(t)
-            
+        if t is not None: x_vals.append(fc); y_vals.append(t)
     return x_vals, y_vals
 
 
-def generate_html_commissioning_report(circle, division, f33, c33, ss_name, ss_code, engg, mva, z_pct, ngr, p_data, df_sch, df_aud, cti):
-    return f"""
-    <!DOCTYPE html><html><head><meta charset="utf-8"><title>Relay Setting Report - {ss_name}</title>
-    <style>
-        body {{ font-family: Arial, sans-serif; margin: 24px; color: #1a1a1a; }}
-        h1 {{ color: #0d47a1; margin-bottom: 4px; font-size: 20px; text-transform: uppercase; }}
-        h2 {{ color: #1565c0; margin-top: 20px; margin-bottom: 8px; font-size: 15px; border-bottom: 2px solid #0d47a1; padding-bottom: 4px; }}
-        .meta-box {{ background: #f5f7fa; border: 1px solid #cbd5e1; padding: 12px; border-radius: 6px; margin-bottom: 16px; font-size: 12.5px; }}
-        .meta-grid {{ display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; }}
-        .report-table {{ width: 100%; border-collapse: collapse; font-size: 11.5px; margin-top: 8px; }}
-        .report-table th {{ background-color: #0d47a1; color: white; padding: 6px; text-align: center; }}
-        .report-table td {{ padding: 5px; text-align: center; border: 1px solid #cbd5e1; }}
-        .sig-grid {{ display: grid; grid-template-columns: repeat(3, 1fr); gap: 24px; margin-top: 48px; text-align: center; font-size: 13px; font-weight: bold; }}
-        .sig-line {{ border-top: 1px solid #333; padding-top: 6px; margin-top: 40px; }}
-    </style></head><body>
-        <h1>⚡ MPPKVVCL Protective Relay Setting & Substation Coordination Report</h1>
-        <p style="margin-top:0; font-size:12.5px; color:#555;">Generated: {datetime.now().strftime("%d-%b-%Y %H:%M")} | Std: IEC 60255</p>
-        <div class="meta-box"><div class="meta-grid">
-            <div><strong>Circle/Division:</strong> {circle} / {division}</div>
-            <div><strong>33/11kV Substation:</strong> {ss_name} ({ss_code})</div>
-            <div><strong>33kV Feeder:</strong> {f33} ({c33})</div>
-            <div><strong>PTR Rating & Vector:</strong> {mva} MVA, 33/11kV, Dyn11</div>
-            <div><strong>PTR Impedance (%Z):</strong> {z_pct}% (Z_LV = {p_data['z_ptr_ohms']} Ω)</div>
-            <div><strong>PTR NGR:</strong> {ngr} Ω (Max EF = {p_data['max_ef_lv_A']} A)</div>
-            <div><strong>Max 3Ph Bus Fault (11/33):</strong> {p_data['max_3ph_sc_lv_A']} A / {p_data['max_3ph_sc_hv_A']} A</div>
-            <div><strong>Prepared By (CTI = {cti:.0f}ms):</strong> {engg}</div>
-        </div></div>
-        <h2>1. Master Substation Relay Setting Schedule</h2>{df_sch.to_html(index=False, border=1, classes="report-table")}
-        <h2>2. Grading Margin Audit</h2>{df_aud.to_html(index=False, border=1, classes="report-table")}
-        <div class="sig-grid"><div><div class="sig-line">Assistant Engineer (STM)</div></div><div><div class="sig-line">Executive Engineer (O&M)</div></div><div><div class="sig-line">Executive Engineer (STM)</div></div></div>
-    </body></html>
-    """
-
-
 # ---------------------------------------------------------
-# 3. STREAMLIT APP CONFIG & SIDEBAR DATABASE LOADER
+# 3. STREAMLIT APP CONFIG & SIDEBAR
 # ---------------------------------------------------------
 st.set_page_config(page_title="MPPKVVCL Relay Coordination Suite", layout="wide")
 
@@ -531,38 +364,35 @@ with st.sidebar:
     st.title("⚡ MPPKVVCL Relay Suite")
     app_page = st.radio("Select Module Page:", ["Page 1: Single-Feeder Deep Dive", "Page 2: Multi-Feeder PTR Coordination & Report"], index=0)
     st.divider()
-    st.header("1. Source Peak Load Sheet")
+    
+    st.header("1. Source Database")
     sheet_url_input = st.text_input("Source Peak Load Sheet URL", value=DEFAULT_PEAK_LOAD_SHEET_URL)
     uploaded_xlsx = st.file_uploader("Or Upload Local Peak Load Sheet (.xlsx/.csv)", type=["xlsx", "csv"])
 
     if uploaded_xlsx is not None:
         if uploaded_xlsx.name.endswith(".csv"):
-            df_raw_up = pd.read_csv(uploaded_xlsx, header=None)
-            db_df = expand_missing_11kv_feeders(parse_circle_tab_row2(df_raw_up, tab_name="UPLOADED"))
-            db_status = "LOCAL_CSV"
+            db_df, db_status = expand_missing_11kv_feeders(parse_circle_tab_row2(pd.read_csv(uploaded_xlsx, header=None), tab_name="UPLOADED")), "LOCAL_CSV"
         else:
             xls_up = pd.ExcelFile(uploaded_xlsx)
             up_dfs = [parse_circle_tab_row2(pd.read_excel(xls_up, sheet_name=tn, header=None), tab_name=tn) for tn in xls_up.sheet_names if "wp" not in tn.lower()]
-            db_df = expand_missing_11kv_feeders(pd.concat([d for d in up_dfs if not d.empty], ignore_index=True)) if up_dfs else pd.DataFrame()
-            db_status = "LOCAL_XLSX"
+            db_df, db_status = expand_missing_11kv_feeders(pd.concat([d for d in up_dfs if not d.empty], ignore_index=True)) if up_dfs else pd.DataFrame(), "LOCAL_XLSX"
     else:
         db_df, loaded_tabs, db_status = load_company_peak_load_database(sheet_url_input)
 
-    st.success(f"✅ Source Sheet Connected ({len(db_df)} records)") if db_status == "LIVE_GSHEET" else st.success(f"✅ Local Sheet Loaded")
-    
+    st.success(f"✅ Database Ready ({len(db_df)} records)")
     st.divider()
-    st.header("2. Target Output Sheet")
+    st.header("2. Target Output (Division Tab)")
     gas_webhook_url = st.text_input("Apps Script Web App URL", value=DEFAULT_GAS_WEBHOOK_URL)
-
     st.divider()
-    st.header("3. PTR Impedance & Breaker (52)")
+    
+    st.header("3. Substation Constants")
     engineer_name = st.text_input("Engineer Name", value="Pallav Swarnkar")
-    ngr_ohms = st.number_input("PTR Neutral Earth Resistance (NGR Ω) [0 = Solid]", min_value=0.0, max_value=500.0, value=40.0, step=1.0)
-    total_cti_sec = (st.number_input("VCB Interrupting Time (ms)", value=60.0) + st.number_input("Relay Margin (ms)", value=40.0)) / 1000.0
+    ngr_ohms = st.number_input("PTR NGR (Ω) [0 = Solid]", value=40.0, step=1.0)
+    total_cti_sec = (st.number_input("VCB Open Time (ms)", value=60.0) + st.number_input("Relay Margin (ms)", value=40.0)) / 1000.0
 
 
 # ---------------------------------------------------------
-# 4. TOP DROPDOWN BAR
+# 4. TOP CASCADING DROPDOWN BAR
 # ---------------------------------------------------------
 st.markdown("### 🏛️ Step-by-Step Substation, PTR & Feeder Selection")
 dd1, dd2, dd3, dd4, dd5 = st.columns(5)
@@ -585,12 +415,10 @@ active_ptr_mva = float(active_row["ptr_mva"])
 active_11kv_code, active_11kv_name, active_11kv_load = str(active_row["feeder_11kv_code"]), str(active_row["feeder_11kv"]), float(active_row["peak_load_amps"])
 
 ptr_z_pct = get_default_ptr_z_pct(active_ptr_mva)
-default_lv_ct = recommend_standard_ct((active_ptr_mva * 1e6) / (math.sqrt(3) * 11000.0))
-default_hv_ct = recommend_standard_ct((active_ptr_mva * 1e6) / (math.sqrt(3) * 33000.0))
-default_fdr_ct = recommend_standard_ct(active_11kv_load)
+default_lv_ct, default_hv_ct, default_fdr_ct = recommend_standard_ct((active_ptr_mva * 1e6) / (math.sqrt(3) * 11000.0)), recommend_standard_ct((active_ptr_mva * 1e6) / (math.sqrt(3) * 33000.0)), recommend_standard_ct(active_11kv_load)
 ptr_data = calculate_ptr_parameters(33.0, 11.0, active_ptr_mva, ptr_z_pct, ngr_ohms, default_lv_ct, default_hv_ct)
 
-st.info(f"**Target:** {active_division} ➔ {active_33kv_fdr} ➔ **{active_ss_name}** ➔ {selected_ptr_label} ➔ **{active_11kv_code}** ({active_11kv_load}A)")
+st.info(f"**Path:** {active_division} ➔ {active_33kv_fdr} ➔ **{active_ss_name}** ➔ {selected_ptr_label} ➔ **{active_11kv_code}** ({active_11kv_load}A)")
 
 
 # =========================================================
@@ -614,105 +442,92 @@ if app_page.startswith("Page 1"):
         r_ct_wind = st.number_input("CT Rct (Ω)", value=0.25)
         rel_va = st.number_input("Relay Burden (VA)", value=0.50)
 
+    # High-Set Calculation Core
     f_reach_amps = calc_fault_at_distance_km(feeder_len_km * (t_reach_pct / 100.0), ptr_data["v_lv_ln_volts"], ptr_data["r_ptr_ohms"], ptr_data["x_ptr_ohms"], r1_km, x1_km)
+    hs_fdr = recommend_highsets("feeder", ptr_data, feeder_reach_fault=f_reach_amps)
+    hs_lv = recommend_highsets("ptr_lv", ptr_data, cti_sec=total_cti_sec)
+    hs_hv = recommend_highsets("ptr_hv", ptr_data)
 
     col1, col2, col3 = st.columns(3)
     with col1:
         st.markdown(f"#### Zone 1: Feeder `{active_11kv_code}`")
         f_ct = st.number_input("1. CT Primary (A)", value=float(default_fdr_ct), step=50.0)
         c1a, c1b = st.columns(2)
-        f_va = c1a.selectbox("Feeder CT VA", [10.0, 15.0, 30.0], index=1)
-        f_cls = c1b.selectbox("Feeder CT Class", list(CT_CLASS_PRESETS.keys()), index=0)
+        f_va, f_cls = c1a.selectbox("CT VA", [10.0, 15.0, 30.0], index=1), c1b.selectbox("CT Class", list(CT_CLASS_PRESETS.keys()), index=0)
         f_crv = st.selectbox("IDMT Curve", list(CURVE_CONSTANTS.keys()), index=0, key="fc")
         f_51p = st.number_input("2. Phase 51 Pickup (A)", value=float(round(active_11kv_load * 1.25, 0)), step=5.0)
         f_51tms = st.number_input("3. Phase 51 TMS", value=0.08, format="%.2f")
         f_51np = st.number_input("4. Earth 51N Pickup (A)", value=float(round(f_ct * 0.15, 0)), step=5.0)
         f_51ntms = st.number_input("5. Earth 51N TMS", value=0.05, format="%.2f")
-        f_50_en = st.checkbox("Enable 50 High-Set", value=True, key="f50en")
-        f_50p = st.number_input("6. 50 Pickup (A)", value=float(round(f_reach_amps, -1)), disabled=not f_50_en)
-        f_50t = st.number_input("50 Delay (s)", value=0.05, disabled=not f_50_en)
+        
+        st.markdown("**ANSI 50 High-Set (Auto-Recommended)**")
+        f_50_en = st.checkbox("Enable Feeder 50 High-Set", value=True, key="f50en")
+        f_50p = st.number_input("6. 50 Pickup (A) [80% Reach]", value=float(hs_fdr['50_pickup']), disabled=not f_50_en)
+        f_50t = st.number_input("50 Delay (s)", value=float(hs_fdr['50_delay']), disabled=not f_50_en)
         f_50n_en = st.checkbox("Enable 50N EF High-Set", value=True, key="f50nen")
-        f_50np = st.number_input("50N Pickup (A)", value=80.0, disabled=not f_50n_en)
-        f_50nt = st.number_input("50N Delay (s)", value=0.05, disabled=not f_50n_en)
+        f_50np = st.number_input("50N Pickup (A)", value=float(hs_fdr['50N_pickup']), disabled=not f_50n_en)
+        f_50nt = st.number_input("50N Delay (s)", value=float(hs_fdr['50N_delay']), disabled=not f_50n_en)
 
     with col2:
         st.markdown(f"#### Zone 2: PTR LV Incomer")
-        lv_ct = st.number_input("PTR LV CT Primary (A)", value=float(default_lv_ct), step=50.0)
+        lv_ct = st.number_input("PTR LV CT (A)", value=float(default_lv_ct), step=50.0)
         c2a, c2b = st.columns(2)
-        lv_va = c2a.selectbox("PTR LV CT VA", [10.0, 15.0, 30.0], index=1)
-        lv_cls = c2b.selectbox("PTR LV CT Class", list(CT_CLASS_PRESETS.keys()), index=2)
+        lv_va, lv_cls = c2a.selectbox("LV CT VA", [10.0, 15.0, 30.0], index=1), c2b.selectbox("LV CT Class", list(CT_CLASS_PRESETS.keys()), index=2)
         lv_crv = st.selectbox("LV IDMT Curve", list(CURVE_CONSTANTS.keys()), index=0, key="lvc")
         lv_51p = st.number_input("LV 51 OC Pickup (A)", value=float(round(ptr_data["i_fl_lv_A"] * 1.15, -1)), step=10.0)
         lv_51tms = st.number_input("LV 51 OC TMS", value=0.15, format="%.2f")
         lv_51g = st.number_input("Neutral 51G Pickup (A)", value=float(round(ptr_data["rec_51g_pickup_A"], 0)), step=5.0)
         lv_51gtms = st.number_input("Neutral 51G TMS", value=0.12, format="%.2f")
-        lv_50_en = st.checkbox("Enable LV 50", value=False, key="lv50en")
-        lv_50p = st.number_input("LV 50 Pickup (A)", value=float(round(ptr_data["max_3ph_sc_lv_A"] * 0.85, -1)), disabled=not lv_50_en)
-        lv_50t = st.number_input("LV 50 Delay (s)", value=0.20, disabled=not lv_50_en)
-        lv_50g_en = st.checkbox("Enable 50G", value=False, key="lv50gen")
-        lv_50gp = st.number_input("50G Pickup (A)", value=130.0, disabled=not lv_50g_en)
-        lv_50gt = st.number_input("50G Delay (s)", value=0.20, disabled=not lv_50g_en)
+        
+        st.markdown("**ANSI 50 High-Set (Definite Time Backup)**")
+        lv_50_en = st.checkbox("Enable LV 50", value=True, key="lv50en")
+        lv_50p = st.number_input("LV 50 Pickup (A)", value=float(hs_lv['50_pickup']), disabled=not lv_50_en)
+        lv_50t = st.number_input("LV 50 Delay (s) [CTI Graded]", value=float(hs_lv['50_delay']), disabled=not lv_50_en)
+        lv_50g_en = st.checkbox("Enable 50G", value=True, key="lv50gen")
+        lv_50gp = st.number_input("50G Pickup (A)", value=float(hs_lv['50N_pickup']), disabled=not lv_50g_en)
+        lv_50gt = st.number_input("50G Delay (s) [CTI Graded]", value=float(hs_lv['50N_delay']), disabled=not lv_50g_en)
 
     with col3:
         st.markdown(f"#### Zone 3: 33kV PTR HV")
-        hv_ct = st.number_input("PTR HV CT Primary (A)", value=float(default_hv_ct), step=50.0)
+        hv_ct = st.number_input("PTR HV CT (A)", value=float(default_hv_ct), step=50.0)
         c3a, c3b = st.columns(2)
-        hv_va = c3a.selectbox("PTR HV CT VA", [10.0, 15.0, 30.0], index=1)
-        hv_cls = c3b.selectbox("PTR HV CT Class", list(CT_CLASS_PRESETS.keys()), index=2)
+        hv_va, hv_cls = c3a.selectbox("HV CT VA", [10.0, 15.0, 30.0], index=1), c3b.selectbox("HV CT Class", list(CT_CLASS_PRESETS.keys()), index=2)
         hv_crv = st.selectbox("HV IDMT Curve", list(CURVE_CONSTANTS.keys()), index=0, key="hvc")
-        hv_51p = st.number_input("HV 51 OC Pickup (A at 33kV)", value=float(round(ptr_data["i_fl_hv_A"] * 1.25, 0)), step=5.0)
+        hv_51p = st.number_input("HV 51 OC Pickup (A@33kV)", value=float(round(ptr_data["i_fl_hv_A"] * 1.25, 0)), step=5.0)
         hv_51tms = st.number_input("HV 51 OC TMS", value=0.22, format="%.2f")
+        
+        st.markdown("**ANSI 50 High-Set (Stable for 11kV Faults)**")
         hv_50_en = st.checkbox("Enable HV 50 (33kV)", value=True, key="hv50en")
-        hv_50p = st.number_input("HV 50 Pickup (A at 33kV)", value=float(round(ptr_data["max_3ph_sc_hv_A"] * 1.25, -1)), disabled=not hv_50_en)
-        hv_50t = st.number_input("HV 50 Delay (s)", value=0.05, disabled=not hv_50_en)
+        hv_50p = st.number_input("HV 50 Pickup (A@33kV) [1.25x 11kV SC]", value=float(hs_hv['50_pickup']), disabled=not hv_50_en)
+        hv_50t = st.number_input("HV 50 Delay (s)", value=float(hs_hv['50_delay']), disabled=not hv_50_en)
 
-    # ======================================================================
-    # TRANSFORMER DIFFERENTIAL (87T) MODULE FOR >= 10 MVA
-    # ======================================================================
+    # 87T Module for 10MVA+
     diff_en_p1 = False
     if active_ptr_mva >= 10.0:
         st.divider()
-        st.subheader(f"🎛️ Transformer Differential Protection (87T) for {active_ptr_mva} MVA PTR")
-        diff_en_p1 = st.checkbox("Enable 87T Differential Settings", value=True)
-        
+        st.subheader(f"🎛️ Transformer Differential (87T) for {active_ptr_mva} MVA PTR")
+        diff_en_p1 = st.checkbox("Enable 87T Settings", value=True)
         if diff_en_p1:
             diff_data = calculate_differential_settings(active_ptr_mva, 33.0, 11.0, hv_ct, lv_ct, ct_sec_rat, ptr_z_pct)
-            
             d_col1, d_col2, d_col3, d_col4 = st.columns(4)
             diff_pickup_p1 = d_col1.number_input("Id> Pickup (pu)", value=float(diff_data['idiff_pickup_pu']), step=0.05)
             diff_s1_p1 = d_col2.number_input("Bias Slope 1 (%)", value=float(diff_data['slope1_pct']), step=5.0)
             diff_s2_p1 = d_col3.number_input("Bias Slope 2 (%)", value=float(diff_data['slope2_pct']), step=5.0)
             diff_hs_p1 = d_col4.number_input("Id>> High-Set (pu)", value=float(diff_data['idiff_highset_pu']), step=1.0)
-            
-            st.info(f"**Relay Matching / Amplitude Compensation (Modern Numerical Relay):**\n"
-                    f"• HV CT Ratio: **{hv_ct}/{ct_sec_rat} A** | LV CT Ratio: **{lv_ct}/{ct_sec_rat} A**\n"
-                    f"• Full Load Current (HV): **{diff_data['i_fl_hv']} A** ➔ Sec: **{diff_data['i_sec_fl_hv']} A**\n"
-                    f"• Full Load Current (LV): **{diff_data['i_fl_lv']} A** ➔ Sec: **{diff_data['i_sec_fl_lv']} A**\n"
-                    f"• Vector Group: **Dyn11** (Phase shift compensation typically internal to relay)\n"
-                    f"• 2nd Harmonic Blocking (Inrush): **{diff_data['harmonic_2nd_pct']}%** | 5th Harm (Overfluxing): **{diff_data['harmonic_5th_pct']}%**\n"
-                    f"• Max Through-Fault: **{diff_data['max_through_fault_pu']} pu**")
+            st.info(f"**87T Compensation Check:** HV CT: {hv_ct}/{ct_sec_rat}A (Sec Fl: {diff_data['i_sec_fl_hv']}A) | LV CT: {lv_ct}/{ct_sec_rat}A (Sec Fl: {diff_data['i_sec_fl_lv']}A) | Max Through-Fault: {diff_data['max_through_fault_pu']} pu")
 
     st.divider()
-
-    if st.button(f"☁️ Save Feeder `{active_11kv_code}` Settings to `{active_division}` Tab", type="primary", use_container_width=True):
+    if st.button(f"☁️ Save Settings to `{active_division}` Tab", type="primary", use_container_width=True):
         p1_rows = [
             {"Bay / Feeder Code": active_11kv_code, "Bay / Protection Zone Name": active_11kv_name, "Voltage": "11 kV", "CT Ratio": f"{int(f_ct)}/{int(ct_sec_rat)} A", "Peak Load (A)": active_11kv_load, "51 Pickup (A) / Plug (%)": f"{f_51p:.0f} A ({(f_51p/f_ct)*100:.1f}%)", "51 TMS": f_51tms, "ANSI 50 High-Set": f"{f_50p:.0f} A ({f_50t}s)" if f_50_en else "Disabled", "51N/51G Pickup (A) / Plug (%)": f"{f_51np:.0f} A ({(f_51np/f_ct)*100:.1f}%)", "51N/51G TMS": f_51ntms},
-            {"Bay / Feeder Code": f"{active_ss_code}-LV", "Bay / Protection Zone Name": f"PTR 11kV LV Incomer ({selected_ptr_label})", "Voltage": "11 kV", "CT Ratio": f"{int(lv_ct)}/{int(ct_sec_rat)} A", "Peak Load (A)": ptr_data["i_fl_lv_A"], "51 Pickup (A) / Plug (%)": f"{lv_51p:.0f} A ({(lv_51p/lv_ct)*100:.1f}%)", "51 TMS": lv_51tms, "ANSI 50 High-Set": f"{lv_50p:.0f} A ({lv_50t}s)" if lv_50_en else "Disabled", "51N/51G Pickup (A) / Plug (%)": f"{lv_51g:.0f} A ({(lv_51g/lv_ct)*100:.1f}%)", "51N/51G TMS": lv_51gtms},
-            {"Bay / Feeder Code": active_33kv_code, "Bay / Protection Zone Name": f"PTR 33kV HV Primary ({active_33kv_fdr})", "Voltage": "33 kV", "CT Ratio": f"{int(hv_ct)}/{int(ct_sec_rat)} A", "Peak Load (A)": ptr_data["i_fl_hv_A"], "51 Pickup (A) / Plug (%)": f"{hv_51p:.0f} A ({(hv_51p/hv_ct)*100:.1f}%)", "51 TMS": hv_51tms, "ANSI 50 High-Set": f"{hv_50p:.0f} A ({hv_50t}s)" if hv_50_en else "Disabled", "51N/51G Pickup (A) / Plug (%)": "Delta Winding", "51N/51G TMS": "N/A"}
+            {"Bay / Feeder Code": f"{active_ss_code}-LV", "Bay / Protection Zone Name": f"PTR 11kV LV Incomer", "Voltage": "11 kV", "CT Ratio": f"{int(lv_ct)}/{int(ct_sec_rat)} A", "Peak Load (A)": ptr_data["i_fl_lv_A"], "51 Pickup (A) / Plug (%)": f"{lv_51p:.0f} A ({(lv_51p/lv_ct)*100:.1f}%)", "51 TMS": lv_51tms, "ANSI 50 High-Set": f"{lv_50p:.0f} A ({lv_50t}s)" if lv_50_en else "Disabled", "51N/51G Pickup (A) / Plug (%)": f"{lv_51g:.0f} A ({(lv_51g/lv_ct)*100:.1f}%)", "51N/51G TMS": lv_51gtms},
+            {"Bay / Feeder Code": active_33kv_code, "Bay / Protection Zone Name": f"PTR 33kV HV Primary", "Voltage": "33 kV", "CT Ratio": f"{int(hv_ct)}/{int(ct_sec_rat)} A", "Peak Load (A)": ptr_data["i_fl_hv_A"], "51 Pickup (A) / Plug (%)": f"{hv_51p:.0f} A ({(hv_51p/hv_ct)*100:.1f}%)", "51 TMS": hv_51tms, "ANSI 50 High-Set": f"{hv_50p:.0f} A ({hv_50t}s)" if hv_50_en else "Disabled", "51N/51G Pickup (A) / Plug (%)": "Delta Winding", "51N/51G TMS": "N/A"}
         ]
-        if diff_en_p1:
-            p1_rows.append({
-                "Bay / Feeder Code": f"{active_ss_code}-87T", "Bay / Protection Zone Name": f"PTR Differential (87T) ({selected_ptr_label})", "Voltage": "33/11 kV",
-                "CT Ratio": f"HV: {int(hv_ct)}/{int(ct_sec_rat)} | LV: {int(lv_ct)}/{int(ct_sec_rat)}", "Peak Load (A)": "N/A",
-                "51 Pickup (A) / Plug (%)": f"Id> Pickup: {diff_pickup_p1} pu", "51 TMS": f"Slope 1: {diff_s1_p1}%",
-                "ANSI 50 High-Set": f"Id>>: {diff_hs_p1} pu", "51N/51G Pickup (A) / Plug (%)": "2nd Harm: 15%", "51N/51G TMS": "5th Harm: 35%"
-            })
-
+        if diff_en_p1: p1_rows.append({"Bay / Feeder Code": f"{active_ss_code}-87T", "Bay / Protection Zone Name": f"PTR Differential (87T)", "Voltage": "33/11 kV", "CT Ratio": f"HV:{int(hv_ct)}/{int(ct_sec_rat)} | LV:{int(lv_ct)}/{int(ct_sec_rat)}", "Peak Load (A)": "N/A", "51 Pickup (A) / Plug (%)": f"Id> Pickup: {diff_pickup_p1} pu", "51 TMS": f"Slope 1: {diff_s1_p1}%", "ANSI 50 High-Set": f"Id>>: {diff_hs_p1} pu", "51N/51G Pickup (A) / Plug (%)": "2nd Harm: 15%", "51N/51G TMS": "5th Harm: 35%"})
         res = push_relay_schedule_to_division_tab(gas_webhook_url, {"engineer": engineer_name, "circle": selected_circle, "division": active_division, "feeder_33kv": active_33kv_fdr, "feeder_33kv_code": active_33kv_code, "substation": active_ss_name, "ss_code": active_ss_code, "ptr_label": selected_ptr_label, "ptr_z_pct": ptr_z_pct, "ngr_ohms": ngr_ohms, "cti_ms": total_cti_sec * 1000.0, "rows": p1_rows})
-        st.success(f"✅ Saved rows to Tab **[{res.get('tabName')}]**!") if res.get("status") == "success" else st.error(f"❌ Error: {res.get('message')}")
+        st.success(f"✅ Saved to **[{res.get('tabName')}]**!") if res.get("status") == "success" else st.error(f"❌ Error: {res.get('message')}")
 
-    actual_reach_km, actual_reach_pct = calc_ansi_50_reach_km(f_50p if f_50_en else 0.0, ptr_data["v_lv_ln_volts"], ptr_data["r_ptr_ohms"], ptr_data["x_ptr_ohms"], r1_km, x1_km, feeder_len_km)
-    
+    # Plotting Logic
     fig = make_subplots(rows=1, cols=3, subplot_titles=("1. Phase OC TCC", "2. Earth Fault TCC", "3. Fault vs Distance"))
     c_fdr, c_lv, c_hv = CURVE_CONSTANTS[f_crv], CURVE_CONSTANTS[lv_crv], CURVE_CONSTANTS[hv_crv]
     
@@ -769,7 +584,8 @@ else:
             "Prospective 3Ph Fault (A)": round(ptr_data["max_3ph_sc_lv_A"] * 0.65, -1),
             "51 Pickup (A)": round((r["peak_load_amps"] if r["peak_load_amps"] > 0 else 95.0) * 1.25, 0), "51 TMS": 0.08,
             "50 Enabled": True, "50 Pickup (A)": round(ptr_data["max_3ph_sc_lv_A"] * 0.52, -1), "50 Delay (s)": 0.05,
-            "51N Pickup (A)": round(recommend_standard_ct(r["peak_load_amps"] if r["peak_load_amps"] > 0 else 95.0) * 0.15, 0), "51N TMS": 0.05
+            "51N Pickup (A)": round(recommend_standard_ct(r["peak_load_amps"] if r["peak_load_amps"] > 0 else 95.0) * 0.15, 0), "51N TMS": 0.05,
+            "50N Enabled": True, "50N Pickup (A)": round(recommend_standard_ct(r["peak_load_amps"] if r["peak_load_amps"] > 0 else 95.0) * 0.15 * 4, 0), "50N Delay (s)": 0.05
         } for _, r in df_ptr.iterrows()])
 
     st.markdown(f"#### 🎯 1. Auto-Calculate Phase & Earth TMS for Feeder `{active_11kv_code}`")
@@ -819,7 +635,12 @@ else:
     with pcol3:
         ptr_hv_ct = st.number_input("PTR HV CT (A)", value=float(default_hv_ct), step=50.0)
         ptr_hv_51p = st.number_input("PTR HV 51 Pickup (A@33kV)", value=float(round(ptr_data["i_fl_hv_A"] * 1.25, 0)))
-        ptr_hv_50p = st.number_input("PTR HV 50 High-Set (A@33kV)", value=float(round(ptr_data["max_3ph_sc_hv_A"] * 1.25, -1)))
+        
+        # PTR HV 50 Recommendation Logic
+        hs_hv_p2 = recommend_highsets("ptr_hv", ptr_data)
+        ptr_hv_50_en = st.checkbox("Enable PTR HV 50 (33kV)", value=True)
+        ptr_hv_50p = st.number_input("PTR HV 50 High-Set (A@33kV)", value=float(hs_hv_p2['50_pickup']), disabled=not ptr_hv_50_en)
+        ptr_hv_50t = st.number_input("PTR HV 50 Delay (s)", value=float(hs_hv_p2['50_delay']), disabled=not ptr_hv_50_en)
 
     max_t_oc, max_t_ef, slow_fdr = 0.0, 0.0, "N/A"
     for _, row in edited_fdf.iterrows():
@@ -835,13 +656,29 @@ else:
         ptr_hv_tms = hv_tms_c["recommended_tms"] if hv_tms_c else 0.25
         lv_ef_c = calc_required_tms(ptr_data["max_ef_lv_A"], ptr_lv_51g, max_t_ef + total_cti_sec, c_sub)
         ptr_lv_eftms = lv_ef_c["recommended_tms"] if lv_ef_c else 0.15
+        
+        # Determine Exact Margin Drop Current for PTR LV High Set
+        fdr_oc_p_slow = edited_fdf.loc[edited_fdf["11kV Feeder Code"] == slow_fdr, "51 Pickup (A)"].values[0]
+        fdr_oc_t_slow = edited_fdf.loc[edited_fdf["11kV Feeder Code"] == slow_fdr, "51 TMS"].values[0]
+        
+        drop_curr = calculate_highset_for_margin_drop(ptr_lv_51p, ptr_lv_tms, fdr_oc_p_slow, fdr_oc_t_slow, c_sub, total_cti_sec)
     else:
         ptr_lv_tms, ptr_lv_eftms, ptr_hv_tms = 0.18, 0.14, 0.25
+        drop_curr = None
 
-    # ======================================================================
-    # TRANSFORMER DIFFERENTIAL (87T) MODULE FOR >= 10 MVA (PAGE 2)
-    # ======================================================================
-    diff_en_p2 = False
+    # PTR LV 50 Recommendation Logic
+    st.markdown("##### PTR LV High-Set Backup")
+    lv_50_c1, lv_50_c2, lv_50_c3, lv_50_c4 = st.columns(4)
+    ptr_lv_50_en = lv_50_c1.checkbox("Enable PTR LV 50", value=True)
+    
+    # Calculate recommended LV high-set pickup. 
+    # Use the drop_curr (if calculated) or just 85% of bus fault.
+    rec_lv_50_p = drop_curr if drop_curr else round(ptr_data["max_3ph_sc_lv_A"] * 0.85, -1)
+    
+    ptr_lv_50p = lv_50_c2.number_input("PTR LV 50 (A)", value=float(rec_lv_50_p), disabled=not ptr_lv_50_en)
+    ptr_lv_50t = lv_50_c3.number_input("PTR LV 50 Delay (s)", value=float(0.05 + total_cti_sec), disabled=not ptr_lv_50_en)
+    if drop_curr: lv_50_c4.info(f"Grading < {total_cti_sec*1000}ms at {drop_curr}A")
+
     if active_ptr_mva >= 10.0:
         st.markdown("#### 🎛️ Transformer Differential Protection (87T)")
         diff_en_p2 = st.checkbox("Include 87T Settings in Schedule", value=True)
@@ -852,6 +689,7 @@ else:
             p2_diff_s1 = d2_2.number_input("Bias Slope 1 (%)", value=float(diff_data_p2['slope1_pct']), step=5.0, key="p2_s1")
             p2_diff_s2 = d2_3.number_input("Bias Slope 2 (%)", value=float(diff_data_p2['slope2_pct']), step=5.0, key="p2_s2")
             p2_diff_hs = d2_4.number_input("Id>> High-Set (pu)", value=float(diff_data_p2['idiff_highset_pu']), step=1.0, key="p2_hs")
+    else: diff_en_p2 = False
 
     k1, k2, k3, k4 = st.columns(4)
     k1.metric("Slowest Feeder", slow_fdr, f"Bus Time: {max_t_oc:.3f}s")
@@ -866,22 +704,16 @@ else:
         sch_rows.append({"Circle / Division": f"{selected_circle} / {active_division}", "Substation & PTR": f"{active_ss_name} ({selected_ptr_label})", "Bay / Feeder Code": r["11kV Feeder Code"], "Bay / Protection Zone Name": r["11kV Feeder Name"], "Voltage": "11 kV", "CT Ratio": f"{int(f_ct)}/5 A", "Peak Load (A)": r["Peak Load (A)"], "51 Pickup (A) / Plug (%)": f"{r['51 Pickup (A)']:.0f} A ({(r['51 Pickup (A)']/f_ct)*100:.1f}%)", "51 TMS": r["51 TMS"], "ANSI 50 High-Set": f"{r['50 Pickup (A)']:.0f} A ({r['50 Delay (s)']}s)" if r["50 Enabled"] else "Disabled", "51N/51G Pickup (A) / Plug (%)": f"{r['51N Pickup (A)']:.0f} A ({(r['51N Pickup (A)']/f_ct)*100:.1f}%)", "51N/51G TMS": r["51N TMS"]})
         
         t_f = calc_composite_time(r["Prospective 3Ph Fault (A)"], r["51 Pickup (A)"], r["51 TMS"], c_sub, r["50 Enabled"], r["50 Pickup (A)"], r["50 Delay (s)"])
-        t_lv = calc_idmt_time(r["Prospective 3Ph Fault (A)"], ptr_lv_51p, ptr_lv_tms, c_sub)
-        t_hv = calc_idmt_time(r["Prospective 3Ph Fault (A)"], ptr_hv_51p * ptr_data["turn_ratio"], ptr_hv_tms, c_sub)
+        t_lv = calc_composite_time(r["Prospective 3Ph Fault (A)"], ptr_lv_51p, ptr_lv_tms, c_sub, ptr_lv_50_en, ptr_lv_50p, ptr_lv_50t)
+        t_hv = calc_composite_time(r["Prospective 3Ph Fault (A)"], ptr_hv_51p * ptr_data["turn_ratio"], ptr_hv_tms, c_sub, ptr_hv_50_en, ptr_hv_50p * ptr_data["turn_ratio"], ptr_hv_50t)
         
         aud_rows.append({"11kV Feeder Code": r["11kV Feeder Code"], "Prospective 3Ph Fault (A)": r["Prospective 3Ph Fault (A)"], "Feeder Comp Time (s)": round(t_f, 3) if t_f else "N/A", "PTR LV Backup (s)": round(t_lv, 3) if t_lv else "N/A", "PTR HV Backup (s)": round(t_hv, 3) if t_hv else "N/A", "Grading Margin LV-Fdr (ms)": round((t_lv - t_f)*1000, 1) if (t_lv and t_f) else "N/A"})
 
-    sch_rows.append({"Circle / Division": f"{selected_circle} / {active_division}", "Substation & PTR": f"{active_ss_name} ({selected_ptr_label})", "Bay / Feeder Code": f"{active_ss_code}-LV", "Bay / Protection Zone Name": f"PTR 11kV LV Incomer", "Voltage": "11 kV", "CT Ratio": f"{int(ptr_lv_ct)}/5 A", "Peak Load (A)": ptr_data["i_fl_lv_A"], "51 Pickup (A) / Plug (%)": f"{ptr_lv_51p:.0f} A ({(ptr_lv_51p/ptr_lv_ct)*100:.1f}%)", "51 TMS": ptr_lv_tms, "ANSI 50 High-Set": "Disabled", "51N/51G Pickup (A) / Plug (%)": f"{ptr_lv_51g:.0f} A ({(ptr_lv_51g/ptr_lv_ct)*100:.1f}%)", "51N/51G TMS": ptr_lv_eftms})
-    sch_rows.append({"Circle / Division": f"{selected_circle} / {active_division}", "Substation & PTR": f"{active_ss_name} ({selected_ptr_label})", "Bay / Feeder Code": active_33kv_code, "Bay / Protection Zone Name": f"PTR 33kV HV Primary", "Voltage": "33 kV", "CT Ratio": f"{int(ptr_hv_ct)}/5 A", "Peak Load (A)": ptr_data["i_fl_hv_A"], "51 Pickup (A) / Plug (%)": f"{ptr_hv_51p:.0f} A ({(ptr_hv_51p/ptr_hv_ct)*100:.1f}%)", "51 TMS": ptr_hv_tms, "ANSI 50 High-Set": f"{ptr_hv_50p:.0f} A @ 33kV (0.05s)", "51N/51G Pickup (A) / Plug (%)": "Isolated", "51N/51G TMS": "N/A"})
+    sch_rows.append({"Circle / Division": f"{selected_circle} / {active_division}", "Substation & PTR": f"{active_ss_name} ({selected_ptr_label})", "Bay / Feeder Code": f"{active_ss_code}-LV", "Bay / Protection Zone Name": f"PTR 11kV LV Incomer", "Voltage": "11 kV", "CT Ratio": f"{int(ptr_lv_ct)}/5 A", "Peak Load (A)": ptr_data["i_fl_lv_A"], "51 Pickup (A) / Plug (%)": f"{ptr_lv_51p:.0f} A ({(ptr_lv_51p/ptr_lv_ct)*100:.1f}%)", "51 TMS": ptr_lv_tms, "ANSI 50 High-Set": f"{ptr_lv_50p:.0f} A ({ptr_lv_50t}s)" if ptr_lv_50_en else "Disabled", "51N/51G Pickup (A) / Plug (%)": f"{ptr_lv_51g:.0f} A ({(ptr_lv_51g/ptr_lv_ct)*100:.1f}%)", "51N/51G TMS": ptr_lv_eftms})
+    sch_rows.append({"Circle / Division": f"{selected_circle} / {active_division}", "Substation & PTR": f"{active_ss_name} ({selected_ptr_label})", "Bay / Feeder Code": active_33kv_code, "Bay / Protection Zone Name": f"PTR 33kV HV Primary", "Voltage": "33 kV", "CT Ratio": f"{int(ptr_hv_ct)}/5 A", "Peak Load (A)": ptr_data["i_fl_hv_A"], "51 Pickup (A) / Plug (%)": f"{ptr_hv_51p:.0f} A ({(ptr_hv_51p/ptr_hv_ct)*100:.1f}%)", "51 TMS": ptr_hv_tms, "ANSI 50 High-Set": f"{ptr_hv_50p:.0f} A @ 33kV ({ptr_hv_50t}s)" if ptr_hv_50_en else "Disabled", "51N/51G Pickup (A) / Plug (%)": "Isolated", "51N/51G TMS": "N/A"})
 
     if diff_en_p2:
-        sch_rows.append({
-            "Circle / Division": f"{selected_circle} / {active_division}", "Substation & PTR": f"{active_ss_name} ({selected_ptr_label})",
-            "Bay / Feeder Code": f"{active_ss_code}-87T", "Bay / Protection Zone Name": f"PTR Differential (87T)", "Voltage": "33/11 kV",
-            "CT Ratio": f"HV:{int(ptr_hv_ct)}/5 | LV:{int(ptr_lv_ct)}/5", "Peak Load (A)": "N/A",
-            "51 Pickup (A) / Plug (%)": f"Id> Pickup: {p2_diff_pickup} pu", "51 TMS": f"Slope 1: {p2_diff_s1}%",
-            "ANSI 50 High-Set": f"Id>>: {p2_diff_hs} pu", "51N/51G Pickup (A) / Plug (%)": "2nd Harm: 15%", "51N/51G TMS": "5th Harm: 35%"
-        })
+        sch_rows.append({"Circle / Division": f"{selected_circle} / {active_division}", "Substation & PTR": f"{active_ss_name} ({selected_ptr_label})", "Bay / Feeder Code": f"{active_ss_code}-87T", "Bay / Protection Zone Name": f"PTR Differential (87T)", "Voltage": "33/11 kV", "CT Ratio": f"HV:{int(ptr_hv_ct)}/5 | LV:{int(ptr_lv_ct)}/5", "Peak Load (A)": "N/A", "51 Pickup (A) / Plug (%)": f"Id> Pickup: {p2_diff_pickup} pu", "51 TMS": f"Slope 1: {p2_diff_s1}%", "ANSI 50 High-Set": f"Id>>: {p2_diff_hs} pu", "51N/51G Pickup (A) / Plug (%)": "2nd Harm: 15%", "51N/51G TMS": "5th Harm: 35%"})
 
     df_sch = pd.DataFrame(sch_rows)
     df_aud = pd.DataFrame(aud_rows)
@@ -890,8 +722,3 @@ else:
     if st.button(f"☁️ Save Schedule to `{active_division}` Tab", type="primary", use_container_width=True):
         res = push_relay_schedule_to_division_tab(gas_webhook_url, {"engineer": engineer_name, "circle": selected_circle, "division": active_division, "feeder_33kv": active_33kv_fdr, "feeder_33kv_code": active_33kv_code, "substation": active_ss_name, "ss_code": active_ss_code, "ptr_label": selected_ptr_label, "ptr_z_pct": ptr_z_pct, "ngr_ohms": ngr_ohms, "cti_ms": total_cti_sec * 1000.0, "rows": sch_rows})
         st.success(f"✅ Saved to **[{res.get('tabName')}]**!") if res.get("status") == "success" else st.error(f"❌ Error: {res.get('message')}")
-
-    dl1, dl2, dl3 = st.columns(3)
-    dl1.download_button("📄 Download HTML Report", generate_html_commissioning_report(selected_circle, active_division, active_33kv_fdr, active_33kv_code, active_ss_name, active_ss_code, engineer_name, active_ptr_mva, ptr_z_pct, ngr_ohms, ptr_data, df_sch, df_aud, total_cti_sec * 1000.0).encode("utf-8"), f"{active_ss_code}_Report.html", "text/html")
-    dl2.download_button("📥 Download Schedule (CSV)", df_sch.to_csv(index=False).encode("utf-8"), f"{active_ss_code}_Schedule.csv", "text/csv")
-    dl3.download_button("📥 Download Audit (CSV)", df_aud.to_csv(index=False).encode("utf-8"), f"{active_ss_code}_Audit.csv", "text/csv")
