@@ -225,35 +225,31 @@ def parse_circle_tab_row2(df_raw, tab_name="UNKNOWN"):
                 col_circle = col
                 used_cols.add(col)
                 break
-    col_div = None
-
-    for col in df.columns:
-        cl = str(col).lower().strip()
-
-        if (
-            "division" in cl
-            and "substation" not in cl
-            and "feeder" not in cl
-            and "code" not in cl
-        ):
-            col_div = col
-            used_cols.add(col)
-            break
-   # 2. Identify Division Column
     
-    #(
-   # col_div = pick_col(
-   #     [r"name\s*of.*city.*division",r"name\s*of.*o.?m.*division",r"city/o.?m.*division",r"\bdivision\b"],
-   #     exclude_patterns=["circle","district","substation","s/s","feeder","code","lat", "long" ],
-   #     validator_fn=lambda c: not is_circle_column(c)
-   # )
+    # 2. Identify Division Column (Using explicit inclusion and excluding sub-division)
+    col_div = pick_col(
+        [
+            r"name\s*of.*city.*o&m.*division",
+            r"name\s*of.*city.*division",
+            r"name\s*of.*o.?m.*division",
+            r"name\s*of.*division",
+            r"city/o.?m.*division",
+            r"\bdivision\b"
+        ],
+        exclude_patterns=[
+            "circle", "district", "substation", "s/s", 
+            "feeder", "code", "lat", "long", 
+            "sub-division", "sub division", "sub_division"
+        ],
+        validator_fn=lambda c: not is_circle_column(c)
+    )
+
     st.write("Columns Detected:")
     st.write(df.columns.tolist())
 
     st.write("Detected Circle Column:", col_circle)
     st.write("Detected Division Column:", col_div)
-    st.write("Detected Substation Column:", col_ss)
-    #print("Detected Division Column:", col_div)
+
     # 3. Identify 33kV Source Feeder Name & Code
     col_33code = pick_col(
         [r"33\s*kv.*feeder.*code", r"33\s*kv.*code", r"33kv.*code", r"feeder code.*33"],
@@ -285,6 +281,8 @@ def parse_circle_tab_row2(df_raw, tab_name="UNKNOWN"):
         ],
         validator_fn=is_valid_substation_column
     )
+
+    st.write("Detected Substation Column:", col_ss)
 
     col_sscode = pick_col(
         [r"33\s*/\s*11.*s\s*/\s*s.*code", r"s\s*/\s*s.*code", r"ss.*code", r"substation.*code", r"sub-station.*code", r"33\s*/\s*11.*code"],
