@@ -472,11 +472,19 @@ def evaluate_ct_saturation(zone_name, ct_primary, ct_secondary, rated_va, ct_cla
 
 
 def build_curve_trace(fc_list, idmt_pickup, tms, c_const, hs_en, hs_pickup, hs_delay):
-    pts = sorted(list(set(fc_list + ([hs_pickup - 0.1, hs_pickup] if hs_en and hs_pickup and pts[0] < hs_pickup <= pts[-1] else []))))
+    pts = list(fc_list)
+    # Check if pts has items, then safely check bounds
+    if pts and hs_en and hs_pickup and hs_pickup > pts[0] and hs_pickup <= pts[-1]:
+        pts.extend([hs_pickup - 0.1, hs_pickup])
+        pts = sorted(list(set(pts)))
+        
     x_vals, y_vals = [], []
     for fc in pts:
         t = calc_composite_time(fc, idmt_pickup, tms, c_const, hs_en, hs_pickup, hs_delay)
-        if t is not None: x_vals.append(fc); y_vals.append(t)
+        if t is not None: 
+            x_vals.append(fc)
+            y_vals.append(t)
+            
     return x_vals, y_vals
 
 
