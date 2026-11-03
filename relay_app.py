@@ -164,7 +164,17 @@ def parse_circle_tab_row2(df_raw, tab_name="UNKNOWN"):
         vals = sample_vals(col_name)
         if not vals:
             return False
-        matches = sum(1 for v in vals if v.upper() == circle_clean or circle_clean in v.upper())
+        
+        matches = 0
+        for v in vals:
+            vu = v.upper()
+            # CRITICAL FIX: If the cell contains "DIV" or "DIVISION", it is definitely NOT the Circle column.
+            if "DIV" in vu or "DIVISION" in vu:
+                return False
+                
+            if circle_clean in vu:
+                matches += 1
+                
         return (matches / len(vals)) > 0.65
 
     def is_valid_substation_column(col_name):
@@ -217,7 +227,7 @@ def parse_circle_tab_row2(df_raw, tab_name="UNKNOWN"):
                         return col
         return None
 
-    # 1. Identify Circle Column (to exclude it from Division / Substation)
+    # 1. Identify Circle Column
     col_circle = pick_col([r"\bcircle\b", r"\bdistrict\b"], validator_fn=is_circle_column)
     if not col_circle:
         for col in df.columns:
@@ -226,26 +236,19 @@ def parse_circle_tab_row2(df_raw, tab_name="UNKNOWN"):
                 used_cols.add(col)
                 break
     
-    # 2. Identify Division Column (Using explicit inclusion and excluding sub-division)
+    # 2. Identify Division Column (Simplified & Hardened against hijack)
     col_div = pick_col(
         [
-            r"name\s*of.*city.*o&m.*division",
-            r"name\s*of.*city.*division",
-            r"name\s*of.*o.?m.*division",
             r"name\s*of.*division",
+            r"name\s*of.*city.*division",
             r"city/o.?m.*division",
             r"\bdivision\b"
         ],
         exclude_patterns=[
-            "circle", "district", "substation", "s/s", 
-            "feeder", "code", "lat", "long", 
+            "substation", "s/s", "feeder", "code", "lat", "long", 
             "sub-division", "sub division", "sub_division"
-        ],
-        validator_fn=lambda c: not is_circle_column(c)
+        ]
     )
-
-    st.write("Columns Detected:")
-    st.write(df.columns.tolist())
 
     st.write("Detected Circle Column:", col_circle)
     st.write("Detected Division Column:", col_div)
@@ -281,8 +284,6 @@ def parse_circle_tab_row2(df_raw, tab_name="UNKNOWN"):
         ],
         validator_fn=is_valid_substation_column
     )
-
-    st.write("Detected Substation Column:", col_ss)
 
     col_sscode = pick_col(
         [r"33\s*/\s*11.*s\s*/\s*s.*code", r"s\s*/\s*s.*code", r"ss.*code", r"substation.*code", r"sub-station.*code", r"33\s*/\s*11.*code"],
