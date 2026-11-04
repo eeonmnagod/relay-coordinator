@@ -30,7 +30,7 @@ KNOWN_MPEZ_CIRCLE_TABS = [
 ]
 
 CURVE_CONSTANTS = {
-    "3.0 Sec curve (IEC Standard Inverse)": 0.14,
+   # "3.0 Sec curve (IEC Standard Inverse)": 0.14,
     "1.3 Sec curve (Fast Inverse)": 0.0607,
 }
 
