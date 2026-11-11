@@ -10,4 +10,4 @@ requests
 plotly
 pandas
 openpyxl
-
+gspread google-auth
