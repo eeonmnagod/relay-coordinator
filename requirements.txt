@@ -8,6 +8,4 @@ pandas
 pytz
 requests
 plotly
-pandas
 openpyxl
-gspread google-auth
