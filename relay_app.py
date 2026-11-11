@@ -3,6 +3,9 @@ import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 import os
+from datetime import datetime
+import gspread
+from google.oauth2.service_account import Credentials
 
 # --- APP SETUP ---
 st.set_page_config(page_title="DISCOM Relay Coordination", layout="wide")
@@ -10,23 +13,97 @@ st.set_page_config(page_title="DISCOM Relay Coordination", layout="wide")
 st.title("⚡ Protection Relay Time Grading (OC & EF)")
 st.markdown("""
 **Hierarchical Constraint Mode:** 
-This tool now enforces the "Hard Ceiling Rule". A downstream relay's High-Set will automatically be capped by its immediate upstream relay's High-Set (referred across voltage levels) to prevent racing and maintain selectivity.
+This tool enforces the "Hard Ceiling Rule". A downstream relay's High-Set will automatically be capped by its immediate upstream relay's High-Set (referred across voltage levels) to prevent racing and maintain selectivity.
 """)
 
-# --- DATABASE LOGIC ---
+# --- DATABASE & GOOGLE SHEETS LOGIC ---
 DATA_FILE = "discom_relay_database.csv"
+GSHEET_URL = "https://docs.google.com/spreadsheets/d/1jzdbWPRC-zKd7qeQ9d5_eimUjqwYd5LbtCtTxmuhmOQ/edit?usp=sharing"
+SERVICE_ACCOUNT_FILE = "service_account.json"
+
+COLUMNS = [
+    "Substation", "Feeder", "Voltage", "CT (A)", "Curve",
+    "OC Pick-up (A)", "OC TMS", "OC Inst (A)", 
+    "EF Pick-up (A)", "EF TMS", "EF Inst (A)"
+]
 
 def load_db():
     if os.path.exists(DATA_FILE):
         return pd.read_csv(DATA_FILE)
-    return pd.DataFrame(columns=[
-        "Substation", "Feeder", "Voltage", "CT (A)", "Curve",
-        "OC Pick-up (A)", "OC TMS", "OC Inst (A)", 
-        "EF Pick-up (A)", "EF TMS", "EF Inst (A)"
-    ])
+    return pd.DataFrame(columns=COLUMNS)
 
 def save_db(dataframe):
     dataframe.to_csv(DATA_FILE, index=False)
+
+def get_gspread_client():
+    scopes = [
+        "https://www.googleapis.com/auth/spreadsheets",
+        "https://www.googleapis.com/auth/drive"
+    ]
+    if "gcp_service_account" in st.secrets:
+        creds = Credentials.from_service_account_info(
+            st.secrets["gcp_service_account"], scopes=scopes
+        )
+        return gspread.authorize(creds)
+    elif os.path.exists(SERVICE_ACCOUNT_FILE):
+        creds = Credentials.from_service_account_file(
+            SERVICE_ACCOUNT_FILE, scopes=scopes
+        )
+        return gspread.authorize(creds)
+    else:
+        raise FileNotFoundError(
+            "Google credentials not found. Add `service_account.json` to your project directory "
+            "or configure `[gcp_service_account]` in `.streamlit/secrets.toml`."
+        )
+
+def sync_to_gsheet(dataframe, mode="overwrite"):
+    client = get_gspread_client()
+    sh = client.open_by_url(GSHEET_URL)
+    tab_name = datetime.now().strftime("%d-%b-%Y")
+    clean_df = dataframe.fillna("")
+    
+    try:
+        worksheet = sh.worksheet(tab_name)
+        if mode == "overwrite":
+            worksheet.clear()
+            data_to_write = [clean_df.columns.values.tolist()] + clean_df.values.tolist()
+            worksheet.update(values=data_to_write, range_name="A1")
+        elif mode == "append":
+            existing_records = worksheet.get_all_values()
+            if not existing_records:
+                worksheet.append_row(clean_df.columns.values.tolist())
+            worksheet.append_rows(clean_df.values.tolist())
+    except gspread.exceptions.WorksheetNotFound:
+        worksheet = sh.add_worksheet(title=tab_name, rows="100", cols="20")
+        data_to_write = [clean_df.columns.values.tolist()] + clean_df.values.tolist()
+        worksheet.update(values=data_to_write, range_name="A1")
+        
+    return tab_name
+
+def sync_analytics_to_gsheet(analytics_data):
+    """
+    Saves calculation results to a dedicated Analytics tab for today's date.
+    """
+    client = get_gspread_client()
+    sh = client.open_by_url(GSHEET_URL)
+    tab_name = "Analytics_" + datetime.now().strftime("%d-%b-%Y")
+    
+    headers = list(analytics_data.keys())
+    # Clean None/NaN values for writing to Sheets
+    values = [str(v) if pd.notna(v) and v is not None else "N/A" for v in analytics_data.values()]
+    
+    try:
+        worksheet = sh.worksheet(tab_name)
+        existing_records = worksheet.get_all_values()
+        if not existing_records:
+            worksheet.append_row(headers)
+        worksheet.append_row(values)
+    except gspread.exceptions.WorksheetNotFound:
+        worksheet = sh.add_worksheet(title=tab_name, rows="100", cols="20")
+        worksheet.append_row(headers)
+        worksheet.append_row(values)
+        
+    return tab_name
 
 db_df = load_db()
 
@@ -46,11 +123,10 @@ def calc_time(fault_current, pickup_current, tms, curve_constant):
 
 def parse_voltage(v_str):
     try:
-        return float(v_str.lower().replace("kv", "").strip())
+        return float(str(v_str).lower().replace("kv", "").strip())
     except:
         return 1.0
 
-# --- NUMERICAL HIGH-SET CALCULATOR (WITH CEILING CONSTRAINTS) ---
 def calculate_high_set_limit(up_row, down_row, fault_type="OC", margin=0.100, max_fc=50000):
     down_v = parse_voltage(down_row["Voltage"])
     up_v = parse_voltage(up_row["Voltage"])
@@ -67,7 +143,6 @@ def calculate_high_set_limit(up_row, down_row, fault_type="OC", margin=0.100, ma
     if pd.isna(down_pu) or pd.isna(up_pu):
         return None, None, None, trans_ratio, "Pick-up parameters missing."
 
-    # 1. Calculate Mathematical Convergence Limit (100ms break)
     def get_margin(I_down):
         I_up = I_down * trans_ratio
         t_d = calc_time(I_down, down_pu, down_tms, c_down)
@@ -91,7 +166,7 @@ def calculate_high_set_limit(up_row, down_row, fault_type="OC", margin=0.100, ma
         msg = f"Grading Fails early (margin {m_low*100:.0f}ms at pick-up)."
     elif m_high > margin:
         math_limit = max_fc
-        msg = f"Curves never converge < 100ms within {max_fc}A."
+        msg = f"Curves never converge less than 100ms within {max_fc}A."
     else:
         for _ in range(100):
             mid = (low + high) / 2
@@ -103,21 +178,17 @@ def calculate_high_set_limit(up_row, down_row, fault_type="OC", margin=0.100, ma
         math_limit = mid
         msg = f"Mathematical convergence at {math_limit:.0f} A."
 
-    # 2. Check Upstream Ceiling Constraint
     upstream_inst = up_row.get(f"{fault_type} Inst (A)")
     ceiling_limit = None
-    if pd.notna(upstream_inst) and upstream_inst > 0:
-        # Refer the upstream limit to the downstream voltage side
-        ceiling_limit = upstream_inst / trans_ratio
+    if pd.notna(upstream_inst) and upstream_inst != "" and float(upstream_inst) > 0:
+        ceiling_limit = float(upstream_inst) / trans_ratio
 
-    # 3. Apply the strictest constraint
     final_limit = math_limit
     if ceiling_limit is not None and (math_limit is None or ceiling_limit < math_limit):
         final_limit = ceiling_limit
-        msg = f"Capped by Upstream High-Set limit."
+        msg = "Capped by Upstream High-Set limit."
 
     return final_limit, math_limit, ceiling_limit, trans_ratio, msg
-
 
 # --- UI INJECTION ---
 st.sidebar.header("🎨 UI Settings")
@@ -127,6 +198,8 @@ if dark_mode:
     plot_template = "plotly_dark"
 else:
     plot_template = "plotly_white"
+
+sync_gsheet_auto = st.sidebar.toggle("☁️ Auto-Sync to Google Sheets", value=True)
 
 # --- SIDEBAR INPUTS ---
 st.sidebar.header("1. Feeder Details")
@@ -146,7 +219,6 @@ ef_pickup = st.sidebar.number_input("EF Pick-up (A)", min_value=1.0, step=1.0, v
 ef_tms = st.sidebar.number_input("EF TMS", min_value=0.01, step=0.01, value=None)
 ef_inst = st.sidebar.number_input("EF Inst / High-Set (A) [Optional]", min_value=10.0, step=10.0, value=None)
 
-# Save to Database Button
 if st.sidebar.button("💾 Add Relay to Database", type="primary"):
     if None in [substation, feeder, ct_rating] or substation == "" or feeder == "":
         st.sidebar.error("⚠️ Please fill out Substation, Feeder, and CT Rating.")
@@ -159,7 +231,14 @@ if st.sidebar.button("💾 Add Relay to Database", type="primary"):
         }])
         updated_db = pd.concat([db_df, new_row], ignore_index=True)
         save_db(updated_db)
-        st.sidebar.success("Added to database!")
+        st.sidebar.success("Added to local database!")
+        
+        if sync_gsheet_auto:
+            try:
+                tab_created = sync_to_gsheet(new_row, mode="append")
+                st.sidebar.success(f"☁️ Appended to Google Sheet tab: **{tab_created}**")
+            except Exception as e:
+                st.sidebar.error(f"Google Sheet Sync Failed: {e}")
         st.rerun()
 
 st.divider()
@@ -171,10 +250,26 @@ with col_table:
     st.subheader("Coordination Database")
     if not db_df.empty:
         edited_df = st.data_editor(db_df, num_rows="dynamic", use_container_width=True)
-        if st.button("🔄 Commit Table Changes"):
+        
+        btn_col1, btn_col2 = st.columns(2)
+        if btn_col1.button("🔄 Commit Table Changes", use_container_width=True):
             save_db(edited_df)
-            st.success("Database updated successfully!")
+            st.success("Local CSV database updated!")
+            if sync_gsheet_auto:
+                try:
+                    tab_created = sync_to_gsheet(edited_df, mode="overwrite")
+                    st.success(f"☁️ Synced table to Google Sheet tab: **{tab_created}**")
+                except Exception as e:
+                    st.error(f"Google Sheet Sync Failed: {e}")
             st.rerun()
+            
+        if btn_col2.button("📤 Save Current Table to Google Sheet", type="secondary", use_container_width=True):
+            try:
+                with st.spinner("Uploading to Google Sheets..."):
+                    tab_created = sync_to_gsheet(edited_df, mode="overwrite")
+                st.success(f"✅ Saved to Google Sheet in tab **{tab_created}**!")
+            except Exception as e:
+                st.error(f"❌ Failed to save to Google Sheet: {e}")
     else:
         st.info("The database is empty. Add a relay configuration to view the TCC plot.")
 
@@ -202,7 +297,7 @@ with col_calc:
             if t_ratio != 1.0:
                 st.info(f"🔄 **Transformer Reflection:** Downstream faults are multiplied by **{t_ratio:.3f}**.")
             elif up_row['Voltage'] == down_row['Voltage']:
-                st.info(f"⚡ **Same Voltage Bus:** E.g., 33kV Outgoing graded against a downstream 33kV Substation Incoming VCB. No transformer reflection applied.")
+                st.info("⚡ **Same Voltage Bus:** No transformer reflection applied.")
 
             st.markdown("---")
             st.markdown("### Phase Overcurrent (OC)")
@@ -210,7 +305,7 @@ with col_calc:
             if ceil_oc: st.write(f"🛑 **Upstream Ceiling:** {ceil_oc:.0f} A")
             
             if limit_oc:
-                st.error(f"**Required Setting:** Set OC High-Set ≤ **{limit_oc:.0f} A**")
+                st.error(f"**Required Setting:** Set OC High-Set <= **{limit_oc:.0f} A**")
                 st.caption(msg_oc)
                 st.session_state['hs_limit_oc'] = limit_oc
             else:
@@ -224,17 +319,43 @@ with col_calc:
             if limit_ef:
                 if limit_oc and limit_ef > limit_oc:
                     practical_limit_ef = limit_oc
-                    st.error(f"**Required Setting:** Set EF High-Set ≤ **{practical_limit_ef:.0f} A**")
-                    st.caption("*(EF constrained mathematically, but further capped by the practical OC limit).*")
+                    st.error(f"**Required Setting:** Set EF High-Set <= **{practical_limit_ef:.0f} A**")
+                    st.caption("*(EF constrained mathematically, but further capped by practical OC limit).*")
                     st.session_state['hs_limit_ef'] = practical_limit_ef
+                    limit_ef = practical_limit_ef # Update for export
                 else:
-                    st.error(f"**Required Setting:** Set EF High-Set ≤ **{limit_ef:.0f} A**")
+                    st.error(f"**Required Setting:** Set EF High-Set <= **{limit_ef:.0f} A**")
                     st.caption(msg_ef)
                     st.session_state['hs_limit_ef'] = limit_ef
             else:
                 st.warning(msg_ef)
                 
             st.session_state['hs_down_v'] = parse_voltage(down_row["Voltage"])
+            
+            # --- Store calculation data for export ---
+            st.session_state['last_analytics'] = {
+                "Timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                "Upstream Relay": up_selection,
+                "Downstream Relay": down_selection,
+                "OC Math Limit (A)": round(math_oc, 2) if math_oc else None,
+                "OC Ceiling Limit (A)": round(ceil_oc, 2) if ceil_oc else None,
+                "OC Recommended Limit (A)": round(limit_oc, 2) if limit_oc else None,
+                "OC Message": msg_oc,
+                "EF Math Limit (A)": round(math_ef, 2) if math_ef else None,
+                "EF Ceiling Limit (A)": round(ceil_ef, 2) if ceil_ef else None,
+                "EF Recommended Limit (A)": round(limit_ef, 2) if limit_ef else None,
+                "EF Message": msg_ef
+            }
+
+        if 'last_analytics' in st.session_state:
+            st.markdown("---")
+            if st.button("📤 Export Analytics to Sheets"):
+                try:
+                    with st.spinner("Saving analytics to Google Sheets..."):
+                        analytics_tab = sync_analytics_to_gsheet(st.session_state['last_analytics'])
+                    st.success(f"✅ Saved calculations to **{analytics_tab}**!")
+                except Exception as e:
+                    st.error(f"❌ Failed to save analytics: {e}")
             
     else:
         st.warning("Save at least two relays to the database to use this feature.")
@@ -263,17 +384,20 @@ if not db_df.empty:
         tms_val = row[f"{fault_type_key} TMS"]
         inst_val = row[f"{fault_type_key} Inst (A)"]
         
-        if pd.isna(pu_val) or pd.isna(tms_val):
+        if pd.isna(pu_val) or pd.isna(tms_val) or pu_val == "" or tms_val == "":
             continue 
+        
+        pu_val = float(pu_val)
+        tms_val = float(tms_val)
         
         x_vals = []
         y_vals = []
         
-        inst_val_base = inst_val * (row_v_val / base_v_val) if pd.notna(inst_val) and inst_val > 0 else None
+        inst_val_base = float(inst_val) * (row_v_val / base_v_val) if pd.notna(inst_val) and inst_val != "" and float(inst_val) > 0 else None
 
         for fc_base in base_plot_currents:
             if inst_val_base and fc_base > inst_val_base:
-                continue # Bypass IDMT curve plotting beyond Instantaneous setting
+                continue 
                 
             fc_relay = fc_base * (base_v_val / row_v_val)
             t_idmt = calc_time(fc_relay, pu_val, tms_val, c_const)
@@ -282,15 +406,15 @@ if not db_df.empty:
                 x_vals.append(fc_base)
                 y_vals.append(t_idmt)
 
-        # Plot Instantaneous Drop Visually
-        if inst_val_base and inst_val_base in base_plot_currents:
+        if inst_val_base and inst_val_base <= max(base_plot_currents):
             t_idmt_at_inst = calc_time(inst_val_base * (base_v_val / row_v_val), pu_val, tms_val, c_const)
-            x_vals.append(inst_val_base)
-            y_vals.append(t_idmt_at_inst) 
-            x_vals.append(inst_val_base)
-            y_vals.append(0.03) # Approximate 30ms Instantaneous breaker time
-            x_vals.append(max(base_plot_currents))
-            y_vals.append(0.03)
+            if not np.isnan(t_idmt_at_inst):
+                x_vals.append(inst_val_base)
+                y_vals.append(t_idmt_at_inst) 
+                x_vals.append(inst_val_base)
+                y_vals.append(0.03) 
+                x_vals.append(max(base_plot_currents))
+                y_vals.append(0.03)
 
         fig.add_trace(go.Scatter(
             x=x_vals, 
