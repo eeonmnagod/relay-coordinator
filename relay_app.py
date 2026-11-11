@@ -130,7 +130,7 @@ else:
 
 # --- SIDEBAR INPUTS ---
 st.sidebar.header("1. Feeder Details")
-substation = st.sidebar.text_input("Substation Name", placeholder="e.g. Nainpur", value=None)
+substation = st.sidebar.text_input("Substation Name", placeholder="e.g. Chhindwara", value=None)
 feeder = st.sidebar.text_input("Feeder Name", placeholder="e.g. 33kV PTR", value=None)
 voltage_level = st.sidebar.selectbox("Voltage Level", ["132 kV", "33 kV", "11 kV"])
 ct_rating = st.sidebar.number_input("CT Rating (Primary Amps)", min_value=10.0, step=50.0, value=None)
