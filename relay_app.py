@@ -102,11 +102,13 @@ def normalize_voltage_label(v_str):
     return "11 kV"
 
 def normalize_curve_label(c_str):
-    """Maps '1.3Sec' or '3.0Sec' -> '1.3 Sec curve' or '3.0 Sec curve'."""
-    s = str(c_str).lower()
-    if "3" in s:
+    """Maps '1.3', '1.3Sec', '1.3 Sec' -> '1.3 Sec curve', and '3', '3.0', '3.0Sec' -> '3.0 Sec curve'."""
+    s = str(c_str).strip().lower()
+    if "1.3" in s or "1,3" in s:
+        return "1.3 Sec curve"
+    elif "3.0" in s or re.search(r"\b3\b", s):
         return "3.0 Sec curve"
-    return "1.3 Sec curve"
+    return "1.3 Sec curve"  # Default to 1.3 Sec curve if unspecified
 
 @st.cache_data(ttl=300, show_spinner=False)
 def fetch_google_sheet_tabs():
@@ -121,6 +123,9 @@ def fetch_and_parse_sheet_tab(tab_name):
     Reads either 'Form Responses 1' (coalescing conditional Substation columns and converting
     CT % pickups/high-sets to Primary Amps) or a previously saved coordination tab.
     """
+    # Find ALL conditional 'Substation' and 'IDMT Curve' columns across all division sections
+    substation_col_indices = [i for i, h in enumerate(headers) if "substation" in h.lower()]
+    curve_col_indices = [i for i, h in enumerate(headers) if "curve" in h.lower()]
     client = get_gspread_client()
     sh = client.open_by_url(GSHEET_URL)
     ws = sh.worksheet(tab_name)
