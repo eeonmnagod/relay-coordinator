@@ -15,7 +15,7 @@ st.set_page_config(page_title="DISCOM Relay Coordination", layout="wide")
 st.title("⚡ Protection Relay Time Grading (OC & EF)")
 st.markdown("""
 **Hierarchical Constraint Mode (with Google Sheet Import, PTR NGR & %Z Fault Ceilings):** 
-Enforces the "Hard Ceiling Rule". Imports field relay data directly from `Form Responses 1` (coalescing conditional division/substation sections and converting CT % settings into Primary Amps) and caps downstream High-Sets by upstream limits, PTR `%Z` 3-phase limits, and PTR Neutral Earth Resistance ($R_{\\text{NGR}}$).
+Enforces the "Hard Ceiling Rule". Imports field relay data directly from `Form Responses 1` (coalescing all conditional division/substation sections and converting CT % settings into Primary Amps) and caps downstream High-Sets by upstream limits, PTR `%Z` 3-phase limits, and PTR Neutral Earth Resistance ($R_{\\text{NGR}}$).
 """)
 
 # --- DATABASE & GOOGLE SHEETS LOGIC ---
@@ -75,7 +75,7 @@ def clean_numeric_field(val):
     s = str(val).strip()
     if not s or "no relay" in s.lower() or s.lower() in ("nan", "none", "na", "n/a", "-"):
         return None
-    # Put (?i) strictly at the start of each regex pattern (Python 3.11+ requirement)
+    # Python 3.11+ requires (?i) at the very start of each regex pattern
     s = re.sub(r'(?i)\bO\b', '0', s)
     s = re.sub(r'(?i)O(?=\.)', '0', s)
     s = re.sub(r'(?i)(?<=\.)O', '0', s)
@@ -108,7 +108,7 @@ def normalize_curve_label(c_str):
         return "1.3 Sec curve"
     elif "3.0" in s or re.search(r"\b3\b", s):
         return "3.0 Sec curve"
-    return "1.3 Sec curve"  # Default to 1.3 Sec curve if unspecified
+    return "1.3 Sec curve"
 
 @st.cache_data(ttl=300, show_spinner=False)
 def fetch_google_sheet_tabs():
@@ -120,12 +120,9 @@ def fetch_google_sheet_tabs():
 @st.cache_data(ttl=300, show_spinner=False)
 def fetch_and_parse_sheet_tab(tab_name):
     """
-    Reads either 'Form Responses 1' (coalescing conditional Substation columns and converting
-    CT % pickups/high-sets to Primary Amps) or a previously saved coordination tab.
+    Reads either 'Form Responses 1' (coalescing ALL conditional section columns per row
+    and converting CT % pickups/high-sets to Primary Amps) or a previously saved coordination tab.
     """
-    # Find ALL conditional 'Substation' and 'IDMT Curve' columns across all division sections
-    substation_col_indices = [i for i, h in enumerate(headers) if "substation" in h.lower()]
-    curve_col_indices = [i for i, h in enumerate(headers) if "curve" in h.lower()]
     client = get_gspread_client()
     sh = client.open_by_url(GSHEET_URL)
     ws = sh.worksheet(tab_name)
@@ -136,79 +133,82 @@ def fetch_and_parse_sheet_tab(tab_name):
     headers = [str(h).strip() for h in all_values[0]]
     rows = all_values[1:]
 
-    # Case A: Already in Coordination Database format (e.g. '19-Nov-2026')
+    # Case A: Already in Coordination Database format (e.g. saved Division or Date tab)
     if "OC Pick-up (A)" in headers and "Substation" in headers:
         df_saved = pd.DataFrame(rows, columns=headers)
         for col in COLUMNS:
             if col not in df_saved.columns:
                 df_saved[col] = None
-        for num_col in ["CT (A)", "PTR MVA", "PTR %Z", "PTR NGR (Ohms)", "Max NGR EF (A)",
-                        "OC Pick-up (A)", "OC TMS", "OC Inst (A)", "EF Pick-up (A)", "EF TMS", "EF Inst (A)"]:
+        for num_col in [
+            "CT (A)", "PTR MVA", "PTR %Z", "PTR NGR (Ohms)", "Max NGR EF (A)",
+            "OC Pick-up (A)", "OC TMS", "OC Inst (A)", "EF Pick-up (A)", "EF TMS", "EF Inst (A)"
+        ]:
             df_saved[num_col] = pd.to_numeric(df_saved[num_col], errors="coerce")
         df_saved["Division"] = df_saved["Division"].replace("", tab_name).fillna(tab_name)
         return df_saved[COLUMNS]
 
-    # Case B: 'Form Responses 1' with conditional section columns
-    parsed_records = []
-    # Find indices of all conditional 'Name of Substation' columns (C through J)
-    substation_col_indices = [
-        i for i, h in enumerate(headers)
-        if "substation" in h.lower()
-    ]
-
-    def get_col_idx(keywords, exclude=None):
+    # Case B: 'Form Responses 1' with conditional section columns across multiple branches
+    def coalesce_row_by_keywords(r_padded, keywords, exclude=None):
+        """
+        Scans EVERY column in the row whose header matches `keywords` (not in `exclude`)
+        and returns the first non-blank value, completely skipping empty conditional sections.
+        """
         exclude = exclude or []
         for i, h in enumerate(headers):
             hl = h.lower()
-            if any(k in hl for k in keywords) and not any(ex in hl for ex in exclude):
-                return i
-        return None
+            if any(ex in hl for ex in exclude):
+                continue
+            if any(k in hl for k in keywords):
+                val = r_padded[i].strip()
+                if val and val.lower() not in ("nan", "none", "null"):
+                    return val
+        return ""
 
-    idx_div = get_col_idx(["division"])
-    idx_fdr = get_col_idx(["name of feeder", "feeder"], exclude=["voltage"])
-    idx_volt = get_col_idx(["feeder voltage", "voltage"])
-    idx_ct = get_col_idx(["ct rating", "ct"])
-    idx_curve = get_col_idx(["idmt curve", "curve"])
-    idx_oc_pct = get_col_idx(["oc pick", "idmt oc"])
-    idx_oc_tms = get_col_idx(["tms value of oc", "oc tms"])
-    idx_oc_hs_pct = get_col_idx(["over current high set (%)", "oc high set"])
-    idx_ef_pct = get_col_idx(["earth fault percentage", "idmt earth fault"])
-    idx_ef_tms = get_col_idx(["tms value of ef", "ef tms"])
-    idx_ef_hs_pct = get_col_idx(["earth fault high set (%)", "ef high set"])
+    parsed_records = []
 
     for r in rows:
-        # Pad short rows
+        # Pad row if trailing cells were omitted by Google Sheets API
         r_padded = r + [""] * (len(headers) - len(r))
 
-        div_val = r_padded[idx_div].strip() if idx_div is not None else ""
+        div_val = coalesce_row_by_keywords(r_padded, ["division", "name of division", "div"])
         if not div_val:
-            continue  # Skip blank rows
+            continue  # Skip empty/incomplete form rows
 
-        # Coalesce across all conditional 'Name of Substation' columns
-        substation_val = ""
-        for s_idx in substation_col_indices:
-            candidate = r_padded[s_idx].strip()
-            if candidate:
-                substation_val = candidate.upper()
-                break
-        if not substation_val:
-            substation_val = "UNSPECIFIED"
+        substation_raw = coalesce_row_by_keywords(
+            r_padded, ["substation", "sub-station", "s/s", "33/11"], exclude=["feeder", "code"]
+        )
+        substation_val = substation_raw.upper() if substation_raw else "UNSPECIFIED"
 
-        feeder_val = r_padded[idx_fdr].strip() if idx_fdr is not None else ""
+        feeder_val = coalesce_row_by_keywords(
+            r_padded, ["name of feeder", "feeder", "bay"], exclude=["voltage", "code"]
+        )
         if not feeder_val:
             continue
 
-        voltage_val = normalize_voltage_label(r_padded[idx_volt]) if idx_volt is not None else "11 kV"
-        ct_pri = parse_ct_primary(r_padded[idx_ct]) if idx_ct is not None else None
-        curve_val = normalize_curve_label(r_padded[idx_curve]) if idx_curve is not None else "1.3 Sec curve"
+        raw_voltage = coalesce_row_by_keywords(r_padded, ["feeder voltage", "voltage"])
+        voltage_val = normalize_voltage_label(raw_voltage) if raw_voltage else "11 kV"
 
-        oc_pct = clean_numeric_field(r_padded[idx_oc_pct]) if idx_oc_pct is not None else None
-        oc_tms = clean_numeric_field(r_padded[idx_oc_tms]) if idx_oc_tms is not None else None
-        oc_hs_pct = clean_numeric_field(r_padded[idx_oc_hs_pct]) if idx_oc_hs_pct is not None else None
+        raw_ct = coalesce_row_by_keywords(r_padded, ["ct rating", "ct ratio", "ct"])
+        ct_pri = parse_ct_primary(raw_ct)
 
-        ef_pct = clean_numeric_field(r_padded[idx_ef_pct]) if idx_ef_pct is not None else None
-        ef_tms = clean_numeric_field(r_padded[idx_ef_tms]) if idx_ef_tms is not None else None
-        ef_hs_pct = clean_numeric_field(r_padded[idx_ef_hs_pct]) if idx_ef_hs_pct is not None else None
+        raw_curve = coalesce_row_by_keywords(r_padded, ["idmt curve", "curve"])
+        curve_val = normalize_curve_label(raw_curve)
+
+        raw_oc_pct = coalesce_row_by_keywords(r_padded, ["oc pick", "idmt oc", "overcurrent pick"])
+        raw_oc_tms = coalesce_row_by_keywords(r_padded, ["tms value of oc", "oc tms"], exclude=["ef", "earth", "51n", "51g"])
+        raw_oc_hs_pct = coalesce_row_by_keywords(r_padded, ["over current high set", "oc high set", "oc inst"], exclude=["ef", "earth"])
+
+        raw_ef_pct = coalesce_row_by_keywords(r_padded, ["earth fault percentage", "idmt earth fault", "ef pick"])
+        raw_ef_tms = coalesce_row_by_keywords(r_padded, ["tms value of ef", "ef tms", "earth tms"], exclude=["oc", "overcurrent"])
+        raw_ef_hs_pct = coalesce_row_by_keywords(r_padded, ["earth fault high set", "ef high set", "ef inst"], exclude=["oc", "overcurrent"])
+
+        oc_pct = clean_numeric_field(raw_oc_pct)
+        oc_tms = clean_numeric_field(raw_oc_tms)
+        oc_hs_pct = clean_numeric_field(raw_oc_hs_pct)
+
+        ef_pct = clean_numeric_field(raw_ef_pct)
+        ef_tms = clean_numeric_field(raw_ef_tms)
+        ef_hs_pct = clean_numeric_field(raw_ef_hs_pct)
 
         # Convert Percentage of CT Rating -> Primary Amps
         oc_pu_amps = round(ct_pri * (oc_pct / 100.0), 2) if (ct_pri and oc_pct and oc_pct > 0) else None
@@ -222,6 +222,14 @@ def fetch_and_parse_sheet_tab(tab_name):
         if m_mva:
             ptr_mva_inferred = float(m_mva.group(1))
 
+        # Check if NGR resistance was recorded anywhere in the form
+        raw_ngr = coalesce_row_by_keywords(r_padded, ["ngr", "neutral earth", "neutral resistance", "earthing resistance"])
+        ngr_val = clean_numeric_field(raw_ngr)
+        max_ngr_ef = None
+        if ngr_val and ngr_val > 0:
+            v_kv_num = parse_voltage(voltage_val)
+            max_ngr_ef = round(((v_kv_num * 1000.0) / math.sqrt(3)) / ngr_val, 2)
+
         parsed_records.append({
             "Division": div_val,
             "Substation": substation_val,
@@ -231,8 +239,8 @@ def fetch_and_parse_sheet_tab(tab_name):
             "Curve": curve_val,
             "PTR MVA": ptr_mva_inferred,
             "PTR %Z": None,
-            "PTR NGR (Ohms)": None,
-            "Max NGR EF (A)": None,
+            "PTR NGR (Ohms)": ngr_val,
+            "Max NGR EF (A)": max_ngr_ef,
             "OC Pick-up (A)": oc_pu_amps,
             "OC TMS": oc_tms,
             "OC Inst (A)": oc_inst_amps,
@@ -459,7 +467,7 @@ else:
 sync_gsheet_auto = st.sidebar.toggle("☁️ Auto-Sync to Google Sheets", value=True)
 
 # -------------------------------------------------------------------------
-# NEW SECTION: FETCH & IMPORT FROM GOOGLE SHEET ('Form Responses 1' / TABS)
+# FETCH & IMPORT FROM GOOGLE SHEET ('Form Responses 1' & SAVED TABS)
 # -------------------------------------------------------------------------
 with st.expander("📥 Fetch Relay Settings from Google Sheet ('Form Responses 1' & Saved Tabs)", expanded=True):
     try:
