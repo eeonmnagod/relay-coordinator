@@ -30,17 +30,30 @@ COLUMNS = [
     "EF Pick-up (A)", "EF TMS", "EF Inst (A)"
 ]
 
+FLOAT_COLUMNS = [
+    "CT (A)", "PTR MVA", "PTR %Z", "PTR NGR (Ohms)", "Max NGR EF (A)",
+    "OC Pick-up (A)", "OC TMS", "OC Inst (A)", 
+    "EF Pick-up (A)", "EF TMS", "EF Inst (A)"
+]
+
+def enforce_float_dtypes(df):
+    """Ensures all numerical columns (especially OC TMS and EF TMS) remain strict float64."""
+    for col in COLUMNS:
+        if col not in df.columns:
+            df[col] = np.nan
+    for f_col in FLOAT_COLUMNS:
+        df[f_col] = pd.to_numeric(df[f_col], errors="coerce").astype("float64")
+    return df[COLUMNS]
+
 def load_db():
     if os.path.exists(DATA_FILE):
         df = pd.read_csv(DATA_FILE)
-        for col in COLUMNS:
-            if col not in df.columns:
-                df[col] = None
-        return df[COLUMNS]
-    return pd.DataFrame(columns=COLUMNS)
+        return enforce_float_dtypes(df)
+    return enforce_float_dtypes(pd.DataFrame(columns=COLUMNS))
 
 def save_db(dataframe):
-    dataframe.to_csv(DATA_FILE, index=False)
+    clean_df = enforce_float_dtypes(dataframe.copy())
+    clean_df.to_csv(DATA_FILE, index=False)
 
 def get_gspread_client():
     scopes = [
@@ -128,7 +141,7 @@ def fetch_and_parse_sheet_tab(tab_name):
     ws = sh.worksheet(tab_name)
     all_values = ws.get_all_values()
     if not all_values or len(all_values) < 2:
-        return pd.DataFrame(columns=COLUMNS)
+        return enforce_float_dtypes(pd.DataFrame(columns=COLUMNS))
 
     headers = [str(h).strip() for h in all_values[0]]
     rows = all_values[1:]
@@ -138,14 +151,9 @@ def fetch_and_parse_sheet_tab(tab_name):
         df_saved = pd.DataFrame(rows, columns=headers)
         for col in COLUMNS:
             if col not in df_saved.columns:
-                df_saved[col] = None
-        for num_col in [
-            "CT (A)", "PTR MVA", "PTR %Z", "PTR NGR (Ohms)", "Max NGR EF (A)",
-            "OC Pick-up (A)", "OC TMS", "OC Inst (A)", "EF Pick-up (A)", "EF TMS", "EF Inst (A)"
-        ]:
-            df_saved[num_col] = pd.to_numeric(df_saved[num_col], errors="coerce")
+                df_saved[col] = np.nan
         df_saved["Division"] = df_saved["Division"].replace("", tab_name).fillna(tab_name)
-        return df_saved[COLUMNS]
+        return enforce_float_dtypes(df_saved)
 
     # Case B: 'Form Responses 1' with conditional section columns across multiple branches
     def coalesce_row_by_keywords(r_padded, keywords, exclude=None):
@@ -167,12 +175,11 @@ def fetch_and_parse_sheet_tab(tab_name):
     parsed_records = []
 
     for r in rows:
-        # Pad row if trailing cells were omitted by Google Sheets API
         r_padded = r + [""] * (len(headers) - len(r))
 
         div_val = coalesce_row_by_keywords(r_padded, ["division", "name of division", "div"])
         if not div_val:
-            continue  # Skip empty/incomplete form rows
+            continue
 
         substation_raw = coalesce_row_by_keywords(
             r_padded, ["substation", "sub-station", "s/s", "33/11"], exclude=["feeder", "code"]
@@ -242,14 +249,14 @@ def fetch_and_parse_sheet_tab(tab_name):
             "PTR NGR (Ohms)": ngr_val,
             "Max NGR EF (A)": max_ngr_ef,
             "OC Pick-up (A)": oc_pu_amps,
-            "OC TMS": oc_tms,
+            "OC TMS": float(oc_tms) if oc_tms is not None else np.nan,
             "OC Inst (A)": oc_inst_amps,
             "EF Pick-up (A)": ef_pu_amps,
-            "EF TMS": ef_tms,
+            "EF TMS": float(ef_tms) if ef_tms is not None else np.nan,
             "EF Inst (A)": ef_inst_amps
         })
 
-    return pd.DataFrame(parsed_records, columns=COLUMNS)
+    return enforce_float_dtypes(pd.DataFrame(parsed_records, columns=COLUMNS))
 
 def sanitize_tab_name(raw_name):
     if not raw_name or pd.isna(raw_name) or str(raw_name).strip() == "":
@@ -484,7 +491,6 @@ with st.expander("📥 Fetch Relay Settings from Google Sheet ('Form Responses 1
         df_sheet_raw = fetch_and_parse_sheet_tab(selected_tab)
 
         if not df_sheet_raw.empty:
-            # Filter only Divisions that actually have non-blank entries (skips blanks)
             filled_divisions = sorted([
                 d for d in df_sheet_raw["Division"].dropna().unique().tolist()
                 if str(d).strip() != ""
@@ -555,37 +561,37 @@ if ptr_preview["max_ef_current_A"] or ptr_preview["max_3ph_sc_A"]:
 
 st.sidebar.header("3. Phase Overcurrent (OC)")
 oc_pickup = st.sidebar.number_input("OC Pick-up (A)", min_value=1.0, step=5.0, value=None)
-oc_tms = st.sidebar.number_input("OC TMS", min_value=0.01, step=0.01, value=None)
+oc_tms = st.sidebar.number_input("OC TMS", min_value=0.005, max_value=5.0, step=0.005, format="%.4f", value=None)
 oc_inst = st.sidebar.number_input("OC Inst / High-Set (A) [Optional]", min_value=10.0, step=10.0, value=None)
 
 st.sidebar.header("4. Earth Fault (EF)")
 ef_default_val = float(ptr_preview["rec_ef_pickup_A"]) if (ptr_ngr_ohms and ptr_preview["rec_ef_pickup_A"]) else None
 ef_pickup = st.sidebar.number_input("EF Pick-up (A)", min_value=1.0, step=1.0, value=ef_default_val)
-ef_tms = st.sidebar.number_input("EF TMS", min_value=0.01, step=0.01, value=None)
+ef_tms = st.sidebar.number_input("EF TMS", min_value=0.005, max_value=5.0, step=0.005, format="%.4f", value=None)
 ef_inst = st.sidebar.number_input("EF Inst / High-Set (A) [Optional]", min_value=10.0, step=10.0, value=None)
 
 if st.sidebar.button("💾 Add Relay to Database", type="primary"):
     if None in [substation, feeder, ct_rating] or substation == "" or feeder == "":
         st.sidebar.error("⚠️ Please fill out Substation, Feeder, and CT Rating.")
     else:
-        new_row = pd.DataFrame([{
+        new_row = enforce_float_dtypes(pd.DataFrame([{
             "Division": division.strip() if division else "General",
             "Substation": substation.strip(),
             "Feeder": feeder.strip(),
             "Voltage": voltage_level,
-            "CT (A)": ct_rating,
+            "CT (A)": float(ct_rating),
             "Curve": curve_type,
-            "PTR MVA": ptr_mva,
-            "PTR %Z": ptr_z_pct,
-            "PTR NGR (Ohms)": ptr_ngr_ohms,
-            "Max NGR EF (A)": ptr_preview["max_ef_current_A"],
-            "OC Pick-up (A)": oc_pickup,
-            "OC TMS": round(oc_tms, 4) if oc_tms else None,
-            "OC Inst (A)": oc_inst,
-            "EF Pick-up (A)": ef_pickup,
-            "EF TMS": round(ef_tms, 4) if ef_tms else None,
-            "EF Inst (A)": ef_inst
-        }])
+            "PTR MVA": float(ptr_mva) if ptr_mva is not None else np.nan,
+            "PTR %Z": float(ptr_z_pct) if ptr_z_pct is not None else np.nan,
+            "PTR NGR (Ohms)": float(ptr_ngr_ohms) if ptr_ngr_ohms is not None else np.nan,
+            "Max NGR EF (A)": float(ptr_preview["max_ef_current_A"]) if ptr_preview["max_ef_current_A"] is not None else np.nan,
+            "OC Pick-up (A)": float(oc_pickup) if oc_pickup is not None else np.nan,
+            "OC TMS": round(float(oc_tms), 4) if oc_tms is not None else np.nan,
+            "OC Inst (A)": float(oc_inst) if oc_inst is not None else np.nan,
+            "EF Pick-up (A)": float(ef_pickup) if ef_pickup is not None else np.nan,
+            "EF TMS": round(float(ef_tms), 4) if ef_tms is not None else np.nan,
+            "EF Inst (A)": float(ef_inst) if ef_inst is not None else np.nan
+        }]))
         updated_db = pd.concat([db_df, new_row], ignore_index=True)
         save_db(updated_db)
         st.sidebar.success("Added to local database!")
@@ -606,10 +612,29 @@ col_table, col_calc = st.columns([2.2, 1])
 with col_table:
     st.subheader("Coordination Database")
     if not db_df.empty:
-        edited_df = st.data_editor(db_df, num_rows="dynamic", use_container_width=True)
+        db_df = enforce_float_dtypes(db_df)
+        edited_df = st.data_editor(
+            db_df,
+            num_rows="dynamic",
+            use_container_width=True,
+            column_config={
+                "CT (A)": st.column_config.NumberColumn("CT (A)", format="%.1f", step=10.0),
+                "PTR MVA": st.column_config.NumberColumn("PTR MVA", format="%.2f", step=0.5),
+                "PTR %Z": st.column_config.NumberColumn("PTR %Z", format="%.2f", step=0.05),
+                "PTR NGR (Ohms)": st.column_config.NumberColumn("PTR NGR (Ohms)", format="%.1f", step=1.0),
+                "Max NGR EF (A)": st.column_config.NumberColumn("Max NGR EF (A)", format="%.2f", disabled=True),
+                "OC Pick-up (A)": st.column_config.NumberColumn("OC Pick-up (A)", format="%.2f", step=1.0),
+                "OC TMS": st.column_config.NumberColumn("OC TMS", min_value=0.005, max_value=5.0, step=0.005, format="%.4f"),
+                "OC Inst (A)": st.column_config.NumberColumn("OC Inst (A)", format="%.1f", step=10.0),
+                "EF Pick-up (A)": st.column_config.NumberColumn("EF Pick-up (A)", format="%.2f", step=1.0),
+                "EF TMS": st.column_config.NumberColumn("EF TMS", min_value=0.005, max_value=5.0, step=0.005, format="%.4f"),
+                "EF Inst (A)": st.column_config.NumberColumn("EF Inst (A)", format="%.1f", step=10.0),
+            }
+        )
         
         btn_col1, btn_col2, btn_col3 = st.columns(3)
         if btn_col1.button("🔄 Commit Table Changes", use_container_width=True):
+            edited_df = enforce_float_dtypes(edited_df)
             for idx, r in edited_df.iterrows():
                 stats = calculate_ptr_ngr_and_sc(
                     parse_voltage(r.get("Voltage")), r.get("PTR MVA"), r.get("PTR %Z"), r.get("PTR NGR (Ohms)"), r.get("CT (A)")
@@ -631,6 +656,7 @@ with col_table:
             
         if btn_col2.button("📤 Save to Google Sheet (Division Tabs)", type="secondary", use_container_width=True):
             try:
+                edited_df = enforce_float_dtypes(edited_df)
                 with st.spinner("Uploading to Google Sheets by Division tab..."):
                     synced_tabs = []
                     for div_name, grp in edited_df.groupby(edited_df["Division"].fillna("General")):
