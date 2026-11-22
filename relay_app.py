@@ -75,10 +75,10 @@ def clean_numeric_field(val):
     s = str(val).strip()
     if not s or "no relay" in s.lower() or s.lower() in ("nan", "none", "na", "n/a", "-"):
         return None
-    # Replace capital/lowercase letter O used as zero before/after decimal or standalone
+    # Put (?i) strictly at the start of each regex pattern (Python 3.11+ requirement)
     s = re.sub(r'(?i)\bO\b', '0', s)
     s = re.sub(r'(?i)O(?=\.)', '0', s)
-    s = re.sub(r'(?<=\.)(?i)O', '0', s)
+    s = re.sub(r'(?i)(?<=\.)O', '0', s)
     s = s.replace("%", "").strip()
     m = re.search(r"-?\d+(?:\.\d+)?", s)
     return float(m.group(0)) if m else None
