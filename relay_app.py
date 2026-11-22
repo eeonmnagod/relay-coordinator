@@ -14,8 +14,8 @@ st.set_page_config(page_title="DISCOM Relay Coordination", layout="wide")
 
 st.title("⚡ Protection Relay Time Grading (OC & EF)")
 st.markdown("""
-**Hierarchical Constraint Mode (with PTR NGR & %Z Fault Ceilings):** 
-Enforces the "Hard Ceiling Rule". A downstream relay's High-Set is automatically capped by its immediate upstream relay's High-Set (referred across voltage levels), the PTR's 3-phase `%Z` short-circuit limit, and the PTR Neutral Earth Resistance ($R_{\\text{NGR}}$) restricted earth fault ceiling.
+**Hierarchical Constraint Mode (with Google Sheet Import, PTR NGR & %Z Fault Ceilings):** 
+Enforces the "Hard Ceiling Rule". Imports field relay data directly from `Form Responses 1` (coalescing conditional division/substation sections and converting CT % settings into Primary Amps) and caps downstream High-Sets by upstream limits, PTR `%Z` 3-phase limits, and PTR Neutral Earth Resistance ($R_{\\text{NGR}}$).
 """)
 
 # --- DATABASE & GOOGLE SHEETS LOGIC ---
@@ -63,6 +63,181 @@ def get_gspread_client():
             "or configure `[gcp_service_account]` in `.streamlit/secrets.toml`."
         )
 
+def clean_numeric_field(val):
+    """
+    Cleans field-entered relay numbers:
+    - Fixes letter 'O' typed instead of '0' (e.g., 'O.03' -> 0.03, 'O' -> 0.0)
+    - Strips '%' signs and whitespace
+    - Returns None for 'No relay', blanks, or non-numeric text
+    """
+    if val is None or pd.isna(val):
+        return None
+    s = str(val).strip()
+    if not s or "no relay" in s.lower() or s.lower() in ("nan", "none", "na", "n/a", "-"):
+        return None
+    # Replace capital/lowercase letter O used as zero before/after decimal or standalone
+    s = re.sub(r'(?i)\bO\b', '0', s)
+    s = re.sub(r'(?i)O(?=\.)', '0', s)
+    s = re.sub(r'(?<=\.)(?i)O', '0', s)
+    s = s.replace("%", "").strip()
+    m = re.search(r"-?\d+(?:\.\d+)?", s)
+    return float(m.group(0)) if m else None
+
+def parse_ct_primary(ct_str):
+    """Extracts primary CT amps from '200/5', '600/1', or '300'."""
+    if not ct_str:
+        return None
+    s = str(ct_str).strip()
+    if "/" in s:
+        s = s.split("/")[0]
+    return clean_numeric_field(s)
+
+def normalize_voltage_label(v_str):
+    """Maps '33 KV PTR protection', '11 KV', '132 KV' -> '33 kV', '11 kV', '132 kV'."""
+    s = str(v_str).lower()
+    if "132" in s:
+        return "132 kV"
+    elif "33" in s:
+        return "33 kV"
+    return "11 kV"
+
+def normalize_curve_label(c_str):
+    """Maps '1.3Sec' or '3.0Sec' -> '1.3 Sec curve' or '3.0 Sec curve'."""
+    s = str(c_str).lower()
+    if "3" in s:
+        return "3.0 Sec curve"
+    return "1.3 Sec curve"
+
+@st.cache_data(ttl=300, show_spinner=False)
+def fetch_google_sheet_tabs():
+    """Fetches available worksheet names from the Google Sheet."""
+    client = get_gspread_client()
+    sh = client.open_by_url(GSHEET_URL)
+    return [ws.title for ws in sh.worksheets()]
+
+@st.cache_data(ttl=300, show_spinner=False)
+def fetch_and_parse_sheet_tab(tab_name):
+    """
+    Reads either 'Form Responses 1' (coalescing conditional Substation columns and converting
+    CT % pickups/high-sets to Primary Amps) or a previously saved coordination tab.
+    """
+    client = get_gspread_client()
+    sh = client.open_by_url(GSHEET_URL)
+    ws = sh.worksheet(tab_name)
+    all_values = ws.get_all_values()
+    if not all_values or len(all_values) < 2:
+        return pd.DataFrame(columns=COLUMNS)
+
+    headers = [str(h).strip() for h in all_values[0]]
+    rows = all_values[1:]
+
+    # Case A: Already in Coordination Database format (e.g. '19-Nov-2026')
+    if "OC Pick-up (A)" in headers and "Substation" in headers:
+        df_saved = pd.DataFrame(rows, columns=headers)
+        for col in COLUMNS:
+            if col not in df_saved.columns:
+                df_saved[col] = None
+        for num_col in ["CT (A)", "PTR MVA", "PTR %Z", "PTR NGR (Ohms)", "Max NGR EF (A)",
+                        "OC Pick-up (A)", "OC TMS", "OC Inst (A)", "EF Pick-up (A)", "EF TMS", "EF Inst (A)"]:
+            df_saved[num_col] = pd.to_numeric(df_saved[num_col], errors="coerce")
+        df_saved["Division"] = df_saved["Division"].replace("", tab_name).fillna(tab_name)
+        return df_saved[COLUMNS]
+
+    # Case B: 'Form Responses 1' with conditional section columns
+    parsed_records = []
+    # Find indices of all conditional 'Name of Substation' columns (C through J)
+    substation_col_indices = [
+        i for i, h in enumerate(headers)
+        if "substation" in h.lower()
+    ]
+
+    def get_col_idx(keywords, exclude=None):
+        exclude = exclude or []
+        for i, h in enumerate(headers):
+            hl = h.lower()
+            if any(k in hl for k in keywords) and not any(ex in hl for ex in exclude):
+                return i
+        return None
+
+    idx_div = get_col_idx(["division"])
+    idx_fdr = get_col_idx(["name of feeder", "feeder"], exclude=["voltage"])
+    idx_volt = get_col_idx(["feeder voltage", "voltage"])
+    idx_ct = get_col_idx(["ct rating", "ct"])
+    idx_curve = get_col_idx(["idmt curve", "curve"])
+    idx_oc_pct = get_col_idx(["oc pick", "idmt oc"])
+    idx_oc_tms = get_col_idx(["tms value of oc", "oc tms"])
+    idx_oc_hs_pct = get_col_idx(["over current high set (%)", "oc high set"])
+    idx_ef_pct = get_col_idx(["earth fault percentage", "idmt earth fault"])
+    idx_ef_tms = get_col_idx(["tms value of ef", "ef tms"])
+    idx_ef_hs_pct = get_col_idx(["earth fault high set (%)", "ef high set"])
+
+    for r in rows:
+        # Pad short rows
+        r_padded = r + [""] * (len(headers) - len(r))
+
+        div_val = r_padded[idx_div].strip() if idx_div is not None else ""
+        if not div_val:
+            continue  # Skip blank rows
+
+        # Coalesce across all conditional 'Name of Substation' columns
+        substation_val = ""
+        for s_idx in substation_col_indices:
+            candidate = r_padded[s_idx].strip()
+            if candidate:
+                substation_val = candidate.upper()
+                break
+        if not substation_val:
+            substation_val = "UNSPECIFIED"
+
+        feeder_val = r_padded[idx_fdr].strip() if idx_fdr is not None else ""
+        if not feeder_val:
+            continue
+
+        voltage_val = normalize_voltage_label(r_padded[idx_volt]) if idx_volt is not None else "11 kV"
+        ct_pri = parse_ct_primary(r_padded[idx_ct]) if idx_ct is not None else None
+        curve_val = normalize_curve_label(r_padded[idx_curve]) if idx_curve is not None else "1.3 Sec curve"
+
+        oc_pct = clean_numeric_field(r_padded[idx_oc_pct]) if idx_oc_pct is not None else None
+        oc_tms = clean_numeric_field(r_padded[idx_oc_tms]) if idx_oc_tms is not None else None
+        oc_hs_pct = clean_numeric_field(r_padded[idx_oc_hs_pct]) if idx_oc_hs_pct is not None else None
+
+        ef_pct = clean_numeric_field(r_padded[idx_ef_pct]) if idx_ef_pct is not None else None
+        ef_tms = clean_numeric_field(r_padded[idx_ef_tms]) if idx_ef_tms is not None else None
+        ef_hs_pct = clean_numeric_field(r_padded[idx_ef_hs_pct]) if idx_ef_hs_pct is not None else None
+
+        # Convert Percentage of CT Rating -> Primary Amps
+        oc_pu_amps = round(ct_pri * (oc_pct / 100.0), 2) if (ct_pri and oc_pct and oc_pct > 0) else None
+        oc_inst_amps = round(ct_pri * (oc_hs_pct / 100.0), 2) if (ct_pri and oc_hs_pct and oc_hs_pct > 0) else None
+        ef_pu_amps = round(ct_pri * (ef_pct / 100.0), 2) if (ct_pri and ef_pct and ef_pct > 0) else None
+        ef_inst_amps = round(ct_pri * (ef_hs_pct / 100.0), 2) if (ct_pri and ef_hs_pct and ef_hs_pct > 0) else None
+
+        # Infer PTR MVA if mentioned in Feeder name (e.g., '33 KV 5 MVA PTR' -> 5.0)
+        ptr_mva_inferred = None
+        m_mva = re.search(r"(\d+(?:\.\d+)?)\s*MVA", feeder_val.upper())
+        if m_mva:
+            ptr_mva_inferred = float(m_mva.group(1))
+
+        parsed_records.append({
+            "Division": div_val,
+            "Substation": substation_val,
+            "Feeder": feeder_val,
+            "Voltage": voltage_val,
+            "CT (A)": ct_pri,
+            "Curve": curve_val,
+            "PTR MVA": ptr_mva_inferred,
+            "PTR %Z": None,
+            "PTR NGR (Ohms)": None,
+            "Max NGR EF (A)": None,
+            "OC Pick-up (A)": oc_pu_amps,
+            "OC TMS": oc_tms,
+            "OC Inst (A)": oc_inst_amps,
+            "EF Pick-up (A)": ef_pu_amps,
+            "EF TMS": ef_tms,
+            "EF Inst (A)": ef_inst_amps
+        })
+
+    return pd.DataFrame(parsed_records, columns=COLUMNS)
+
 def sanitize_tab_name(raw_name):
     if not raw_name or pd.isna(raw_name) or str(raw_name).strip() == "":
         return datetime.now().strftime("%d-%b-%Y")
@@ -94,7 +269,6 @@ def sync_to_gsheet(dataframe, mode="overwrite", division_tab=None):
     return tab_name
 
 def sync_analytics_to_gsheet(analytics_data):
-    """Saves calculation results to a dedicated Analytics tab for today's date."""
     client = get_gspread_client()
     sh = client.open_by_url(GSHEET_URL)
     tab_name = "Analytics_" + datetime.now().strftime("%d-%b-%Y")
@@ -138,23 +312,14 @@ def parse_voltage(v_str):
         return 11.0
 
 def calculate_ptr_ngr_and_sc(v_ll_kv, ptr_mva, ptr_z_pct, ngr_ohms, ct_primary):
-    """
-    Calculates:
-    - Phase-to-Neutral Voltage (V_LN)
-    - Maximum Restricted Earth Fault Current (I_ef_max = V_LN / R_ngr)
-    - Recommended 51G/EF Pickup (20% of I_ef_max) & Plug Setting (%)
-    - Maximum 3-Phase Symmetrical Fault Current (I_sc_max = I_fl / %Z)
-    """
     v_ln_volts = (v_ll_kv * 1000.0) / math.sqrt(3)
     
-    # 3-Phase Through-Fault Current from PTR MVA and %Z
     i_fl_amps = None
     i_sc_max_3ph = None
     if ptr_mva and pd.notna(ptr_mva) and float(ptr_mva) > 0 and ptr_z_pct and pd.notna(ptr_z_pct) and float(ptr_z_pct) > 0:
         i_fl_amps = (float(ptr_mva) * 1e6) / (math.sqrt(3) * v_ll_kv * 1000.0)
         i_sc_max_3ph = i_fl_amps / (float(ptr_z_pct) / 100.0)
 
-    # Restricted Earth Fault Current from PTR Neutral Earth Resistance (NGR)
     i_ef_max = None
     rec_ef_pickup = (float(ct_primary) * 0.20) if (ct_primary and pd.notna(ct_primary)) else None
     plug_pct = 20.0
@@ -190,7 +355,6 @@ def calculate_high_set_limit(up_row, down_row, fault_type="OC", margin=0.100, ma
     if pd.isna(down_pu) or pd.isna(up_pu) or pd.isna(down_tms) or pd.isna(up_tms):
         return None, None, None, None, trans_ratio, "Pick-up or TMS parameters missing."
 
-    # Check physical fault ceiling from PTR NGR (for EF) or PTR %Z (for OC)
     up_ptr_stats = calculate_ptr_ngr_and_sc(
         up_v, up_row.get("PTR MVA"), up_row.get("PTR %Z"), up_row.get("PTR NGR (Ohms)"), up_row.get("CT (A)")
     )
@@ -200,7 +364,6 @@ def calculate_high_set_limit(up_row, down_row, fault_type="OC", margin=0.100, ma
 
     physical_ceiling = None
     if fault_type == "EF":
-        # Restricted Earth Fault current cannot exceed V_LN / R_NGR
         ngr_ceilings = []
         if down_ptr_stats["max_ef_current_A"]:
             ngr_ceilings.append(down_ptr_stats["max_ef_current_A"])
@@ -290,21 +453,80 @@ else:
 
 sync_gsheet_auto = st.sidebar.toggle("☁️ Auto-Sync to Google Sheets", value=True)
 
-# --- SIDEBAR INPUTS ---
+# -------------------------------------------------------------------------
+# NEW SECTION: FETCH & IMPORT FROM GOOGLE SHEET ('Form Responses 1' / TABS)
+# -------------------------------------------------------------------------
+with st.expander("📥 Fetch Relay Settings from Google Sheet ('Form Responses 1' & Saved Tabs)", expanded=True):
+    try:
+        available_tabs = fetch_google_sheet_tabs()
+        default_tab_idx = available_tabs.index("Form Responses 1") if "Form Responses 1" in available_tabs else 0
+        
+        imp_col1, imp_col2, imp_col3, imp_col4 = st.columns([1.2, 1.2, 1.3, 1.3])
+        with imp_col1:
+            selected_tab = st.selectbox("1️⃣ Select Sheet Tab", available_tabs, index=default_tab_idx)
+            if st.button("🔄 Refresh Sheet Data"):
+                st.cache_data.clear()
+                st.rerun()
+
+        df_sheet_raw = fetch_and_parse_sheet_tab(selected_tab)
+
+        if not df_sheet_raw.empty:
+            # Filter only Divisions that actually have non-blank entries (skips blanks)
+            filled_divisions = sorted([
+                d for d in df_sheet_raw["Division"].dropna().unique().tolist()
+                if str(d).strip() != ""
+            ])
+            with imp_col2:
+                sel_div_import = st.selectbox("2️⃣ Select Division (Populated Only)", filled_divisions, index=0)
+
+            df_div_filtered = df_sheet_raw[df_sheet_raw["Division"] == sel_div_import]
+            filled_substations = sorted([
+                s for s in df_div_filtered["Substation"].dropna().unique().tolist()
+                if str(s).strip() != ""
+            ])
+            with imp_col3:
+                sel_ss_import = st.selectbox(
+                    "3️⃣ Select Substation",
+                    ["ALL SUBSTATIONS"] + filled_substations,
+                    index=0
+                )
+
+            if sel_ss_import != "ALL SUBSTATIONS":
+                df_to_import = df_div_filtered[df_div_filtered["Substation"] == sel_ss_import].copy()
+            else:
+                df_to_import = df_div_filtered.copy()
+
+            with imp_col4:
+                st.metric("Matching Relay Rows", f"{len(df_to_import)} Feeders", f"Division: {sel_div_import}")
+                b_rep, b_app = st.columns(2)
+                if b_rep.button("⬇️ Load (Replace Table)", type="primary", use_container_width=True):
+                    save_db(df_to_import)
+                    st.success(f"Loaded {len(df_to_import)} rows for {sel_div_import}!")
+                    st.rerun()
+                if b_app.button("➕ Append to Table", use_container_width=True):
+                    combined = pd.concat([db_df, df_to_import], ignore_index=True)
+                    save_db(combined)
+                    st.success(f"Appended {len(df_to_import)} rows!")
+                    st.rerun()
+        else:
+            st.info(f"Tab `{selected_tab}` has no populated relay rows.")
+    except Exception as e:
+        st.warning(f"⚠️ Could not connect to Google Sheet to fetch data: {e}")
+
+# --- SIDEBAR MANUAL INPUTS ---
 st.sidebar.header("1. Feeder & PTR Details")
-division = st.sidebar.text_input("Division Name (Target Sheet Tab)", placeholder="e.g. Amarwara", value="Chhindwara")
-substation = st.sidebar.text_input("Substation Name", placeholder="e.g. Chhindwara", value=None)
-feeder = st.sidebar.text_input("Feeder Name", placeholder="e.g. 11kV Main PTR", value=None)
+division = st.sidebar.text_input("Division Name (Target Sheet Tab)", placeholder="e.g. Chaurai", value="Chaurai")
+substation = st.sidebar.text_input("Substation Name", placeholder="e.g. BELKHEDA", value=None)
+feeder = st.sidebar.text_input("Feeder Name", placeholder="e.g. 11kv main", value=None)
 voltage_level = st.sidebar.selectbox("Voltage Level", ["132 kV", "33 kV", "11 kV"], index=2)
 ct_rating = st.sidebar.number_input("CT Rating (Primary Amps)", min_value=10.0, step=50.0, value=None)
-curve_type = st.sidebar.selectbox("Curve Type", list(CURVE_CONSTANTS.keys()), index=1)
+curve_type = st.sidebar.selectbox("Curve Type", list(CURVE_CONSTANTS.keys()), index=0)
 
 st.sidebar.header("2. PTR Impedance & Neutral Earth Resistance")
 ptr_mva = st.sidebar.number_input("PTR Capacity (MVA) [Optional]", min_value=0.5, step=0.5, value=None)
 ptr_z_pct = st.sidebar.number_input("PTR Impedance (%Z) [Optional]", min_value=1.0, step=0.05, value=None)
 ptr_ngr_ohms = st.sidebar.number_input("PTR Neutral Earth Resistance (Ohms) [Optional]", min_value=0.0, step=1.0, value=None)
 
-# Live PTR NGR & Short-Circuit Helper Preview in Sidebar
 v_num_sidebar = parse_voltage(voltage_level)
 ptr_preview = calculate_ptr_ngr_and_sc(v_num_sidebar, ptr_mva, ptr_z_pct, ptr_ngr_ohms, ct_rating)
 if ptr_preview["max_ef_current_A"] or ptr_preview["max_3ph_sc_A"]:
@@ -373,9 +595,8 @@ with col_table:
     if not db_df.empty:
         edited_df = st.data_editor(db_df, num_rows="dynamic", use_container_width=True)
         
-        btn_col1, btn_col2 = st.columns(2)
+        btn_col1, btn_col2, btn_col3 = st.columns(3)
         if btn_col1.button("🔄 Commit Table Changes", use_container_width=True):
-            # Recalculate Max NGR EF (A) if NGR or Voltage was edited directly in the table
             for idx, r in edited_df.iterrows():
                 stats = calculate_ptr_ngr_and_sc(
                     parse_voltage(r.get("Voltage")), r.get("PTR MVA"), r.get("PTR %Z"), r.get("PTR NGR (Ohms)"), r.get("CT (A)")
@@ -386,28 +607,31 @@ with col_table:
             st.success("Local CSV database updated!")
             if sync_gsheet_auto:
                 try:
-                    # Sync grouped by Division tab if multiple divisions exist
                     synced_tabs = []
                     for div_name, grp in edited_df.groupby(edited_df["Division"].fillna("General")):
                         t_name = sync_to_gsheet(grp, mode="overwrite", division_tab=div_name)
                         synced_tabs.append(t_name)
-                    st.success(f"☁️ Synced table to Google Sheet tab(s): **{', '.join(synced_tabs)}**")
+                    st.success(f"☁️ Synced to Division tab(s): **{', '.join(synced_tabs)}**")
                 except Exception as e:
                     st.error(f"Google Sheet Sync Failed: {e}")
             st.rerun()
             
-        if btn_col2.button("📤 Save Current Table to Google Sheet", type="secondary", use_container_width=True):
+        if btn_col2.button("📤 Save to Google Sheet (Division Tabs)", type="secondary", use_container_width=True):
             try:
                 with st.spinner("Uploading to Google Sheets by Division tab..."):
                     synced_tabs = []
                     for div_name, grp in edited_df.groupby(edited_df["Division"].fillna("General")):
                         t_name = sync_to_gsheet(grp, mode="overwrite", division_tab=div_name)
                         synced_tabs.append(t_name)
-                st.success(f"✅ Saved to Google Sheet in Division tab(s): **{', '.join(synced_tabs)}**!")
+                st.success(f"✅ Saved to Division tab(s): **{', '.join(synced_tabs)}**!")
             except Exception as e:
                 st.error(f"❌ Failed to save to Google Sheet: {e}")
+
+        if btn_col3.button("🗑️ Clear Table", use_container_width=True):
+            save_db(pd.DataFrame(columns=COLUMNS))
+            st.rerun()
     else:
-        st.info("The database is empty. Add a relay configuration to view the TCC plot.")
+        st.info("The database is empty. Fetch a Division/Substation from `Form Responses 1` above or add a relay in the sidebar.")
 
 # --- MARGIN ANALYTICS & HIGH-SET CALCULATOR ---
 with col_calc:
@@ -498,7 +722,7 @@ with col_calc:
                     st.error(f"❌ Failed to save analytics: {e}")
             
     else:
-        st.warning("Save at least two relays to the database to use this feature.")
+        st.warning("Load or save at least two relays to the database to use this feature.")
 
 st.divider()
 
@@ -530,7 +754,6 @@ if not db_df.empty:
         pu_val = float(pu_val)
         tms_val = float(tms_val)
         
-        # Check physical truncation ceiling from PTR NGR (for EF) or PTR %Z (for OC)
         row_ptr_stats = calculate_ptr_ngr_and_sc(
             row_v_val, row.get("PTR MVA"), row.get("PTR %Z"), row.get("PTR NGR (Ohms)"), row.get("CT (A)")
         )
@@ -569,7 +792,6 @@ if not db_df.empty:
                 x_vals.append(upper_plot_bound)
                 y_vals.append(0.03)
 
-        # Plot vertical NGR max EF marker if defined on this PTR row
         if fault_type_key == "EF" and max_phys_base:
             fig.add_vline(
                 x=max_phys_base,
