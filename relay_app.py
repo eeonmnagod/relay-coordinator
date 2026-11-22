@@ -13,7 +13,7 @@ import streamlit as st
 # 1. GOOGLE SHEET BACKEND CONFIG & CONDITIONAL FORM PARSER
 # ---------------------------------------------------------
 DEFAULT_PEAK_LOAD_SHEET_URL = (
-    "https://docs.google.com/spreadsheets/d/1Cr3bHdLWR53skYROA4ZgGMScCjm0QHMAuvHKdIrnLvk/edit?usp=drivesdk"
+    "https://docs.google.com/spreadsheets/d/1jzdbWPRC-zKd7qeQ9d5_eimUjqwYd5LbtCtTxmuhmOQ/edit?usp=sharing"
 )
 
 TARGET_OUTPUT_SHEET_URL = (
